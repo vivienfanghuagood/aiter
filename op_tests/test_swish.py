@@ -58,12 +58,12 @@ def triton_swish(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class ModelNewNew(nn.Module):
+class ModelAgent(nn.Module):
     """
     Optimized model that performs a Swish activation using a custom Triton kernel.
     """
     def __init__(self):
-        super(ModelNewNew, self).__init__()
+        super(ModelAgent, self).__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return triton_swish(x)
@@ -95,7 +95,7 @@ def test_correctness():
 def test_speed():
     model_orig = Model().cuda()
     model_new = ModelNew().cuda()
-    model_new_new = ModelNewNew().cuda()
+    model_agent = ModelAgent().cuda()
     
     inputs = get_inputs()
     x = inputs[0]
@@ -165,19 +165,19 @@ def test_speed():
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new_new(x)
+            _ = model_agent(x)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_new_new(x)
+            _ = model_agent(x)
         torch.cuda.synchronize()
-        new_new_time = (time.time() - start) / iterations
+        agent_time = (time.time() - start) / iterations
     
     print(f"\nOriginal Model avg time: {orig_time*1000:.3f} ms")
     print(f"New Model (AITER) avg time: {new_time*1000:.3f} ms")
-    print(f"NewNew Model (LLM) avg time: {new_new_time*1000:.3f} ms")
+    print(f"Agent Model (LLM) avg time: {agent_time*1000:.3f} ms")
     print(f"Speedup AITER: {orig_time/new_time:.2f}x")
-    print(f"Speedup LLM: {orig_time/new_new_time:.2f}x")
+    print(f"Speedup LLM: {orig_time/agent_time:.2f}x")
 
 if __name__ == "__main__":
     test_correctness()

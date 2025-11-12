@@ -343,7 +343,7 @@ def test_speed():
     
     print(f"\nOriginal Model avg time: {orig_time*1000:.3f} ms")
     print(f"New Model (AITER) avg time: {new_time*1000:.3f} ms")
-    print(f"NewNew Model (LLM) avg time: {agent_time*1000:.3f} ms")
+    print(f"Agent Model (LLM) avg time: {agent_time*1000:.3f} ms")
     print(f"Speedup AITER: {orig_time/new_time:.2f}x")
     print(f"Speedup LLM: {orig_time/agent_time:.2f}x")
 

@@ -179,27 +179,17 @@ class ModelNew(nn.Module):
             return triton_matmul(A, B)
         else:
             return torch.matmul(A, B.T)
- 
- 
-class ModelAiter(nn.Module):
+
+
+class ModelAgent(nn.Module):
     """
     Optimized model that performs a matmul using AITER's built-in operations.
     """
     def __init__(self):
-        super(ModelAiter, self).__init__()
+        super(ModelAgent, self).__init__()
  
     def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         return gemm_a16w16(x, w, None, x.dtype)
- 
-class ModelAiterAtomic(nn.Module):
-    """
-    Optimized model that performs a matmul using AITER's built-in operations.
-    """
-    def __init__(self):
-        super(ModelAiterAtomic, self).__init__()
- 
-    def forward(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        return gemm_a16w16_atomic(x, w, x.dtype)
  
  
 M = 1024 * 2
@@ -216,10 +206,10 @@ def get_init_inputs():
  
  
 def test_correctness():
+    """Test that all three implementations produce the same results."""
     model_orig = Model().cuda()
     model_new = ModelNew().cuda()
-    model_aiter = ModelAiter().cuda()
-    model_aiter_atomic = ModelAiterAtomic().cuda()
+    model_agent = ModelAgent().cuda()
    
     inputs = get_inputs()
     x = inputs[0]
@@ -228,19 +218,17 @@ def test_correctness():
     with torch.no_grad():
         output_orig = model_orig(x, w)
         output_new = model_new(x, w)
-        output_aiter = model_aiter(x, w)
-        output_aiter_atomic = model_aiter_atomic(x, w)
+        output_agent = model_agent(x, w)
    
-    checkAllclose(output_orig, output_new, msg="matmul with transposed B: new")
-    checkAllclose(output_orig, output_aiter, msg="matmul with transposed B: aiter")
-    checkAllclose(output_orig, output_aiter_atomic, msg="matmul with transposed B: aiter atomic")
-    print("Correctness test passed!")
+    checkAllclose(output_orig, output_new, msg="matmul with transposed B (ModelNew)", rtol=1e-2, atol=0.01)
+    checkAllclose(output_orig, output_agent, msg="matmul with transposed B (ModelAgent)", rtol=1e-2, atol=0.01)
+    print("✓ Correctness test passed for both ModelNew and ModelAgent!")
  
 def test_speed():
+    """Benchmark the performance of all three implementations."""
     model_orig = Model().cuda()
     model_new = ModelNew().cuda()
-    model_aiter = ModelAiter().cuda()
-    model_aiter_atomic = ModelAiterAtomic().cuda()
+    model_agent = ModelAgent().cuda()
    
     inputs = get_inputs()
     x = inputs[0]
@@ -249,6 +237,7 @@ def test_speed():
     warmup = 10
     iterations = 100
    
+    # Benchmark Original Model
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_orig(x, w)
@@ -266,9 +255,12 @@ def test_speed():
                 _ = model_orig(x, w)
             torch.cuda.synchronize()
    
-    print("Original Model:")
+    print("=" * 80)
+    print("Original Model (PyTorch):")
+    print("=" * 80)
     print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
    
+    # Benchmark ModelNew (Triton)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_new(x, w)
@@ -286,32 +278,15 @@ def test_speed():
                 _ = model_new(x, w)
             torch.cuda.synchronize()
    
-    print("New Model (LLM):")
+    print("\n" + "=" * 80)
+    print("ModelNew (Triton):")
+    print("=" * 80)
     print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
  
+    # Benchmark ModelAgent (AITER)
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_aiter(x, w)
-        torch.cuda.synchronize()
-       
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_new:
-            for _ in range(iterations):
-                _ = model_aiter(x, w)
-            torch.cuda.synchronize()
-   
-    print("Aiter Model:")
-    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
- 
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_aiter_atomic(x, w)
+            _ = model_agent(x, w)
         torch.cuda.synchronize()
  
     with torch.no_grad():
@@ -321,53 +296,26 @@ def test_speed():
             with_stack=True,
             with_modules=True,
             record_shapes=True,
-        ) as prof_new:
+        ) as prof_agent:
             for _ in range(iterations):
-                _ = model_aiter_atomic(x, w)
+                _ = model_agent(x, w)
             torch.cuda.synchronize()
    
-    print("Aiter Atomic Model:")
-    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print("\n" + "=" * 80)
+    print("ModelAgent (AITER gemm_a16w16):")
+    print("=" * 80)
+    print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
    
-    # with torch.no_grad():
-    #     for _ in range(warmup):
-    #         _ = model_orig(x)
-    #     torch.cuda.synchronize()
-    #     start = time.time()
-    #     for _ in range(iterations):
-    #         _ = model_orig(x)
-    #     torch.cuda.synchronize()
-    #     orig_time = (time.time() - start) / iterations
-   
-    # with torch.no_grad():
-    #     for _ in range(warmup):
-    #         _ = model_new(x)
-    #     torch.cuda.synchronize()
-    #     start = time.time()
-    #     for _ in range(iterations):
-    #         _ = model_new(x)
-    #     torch.cuda.synchronize()
-    #     new_time = (time.time() - start) / iterations
-   
-    # with torch.no_grad():
-    #     for _ in range(warmup):
-    #         _ = model_aiter(x)
-    #     torch.cuda.synchronize()
-    #     start = time.time()
-    #     for _ in range(iterations):
-    #         _ = model_aiter(x)
-    #     torch.cuda.synchronize()
-    #     new_new_time = (time.time() - start) / iterations
-   
+    # Simple timing measurements
     orig_elapsed_gpu_times = []
     for _ in range(iterations):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        model_orig(*inputs)
+        _ = model_orig(x, w)
         end_event.record()
         torch.cuda.synchronize()
-        orig_elapsed_gpu_times.append(start_event.elapsed_time(end_event))  # milliseconds
+        orig_elapsed_gpu_times.append(start_event.elapsed_time(end_event))
     orig_time = sum(orig_elapsed_gpu_times) / iterations
  
     new_elapsed_gpu_times = []
@@ -375,42 +323,44 @@ def test_speed():
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        model_new(*inputs)
+        _ = model_new(x, w)
         end_event.record()
         torch.cuda.synchronize()
-        new_elapsed_gpu_times.append(start_event.elapsed_time(end_event))  # milliseconds
+        new_elapsed_gpu_times.append(start_event.elapsed_time(end_event))
     new_time = sum(new_elapsed_gpu_times) / iterations
  
-    aiter_elapsed_gpu_times = []
+    agent_elapsed_gpu_times = []
     for _ in range(iterations):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        model_aiter(*inputs)
+        _ = model_agent(x, w)
         end_event.record()
         torch.cuda.synchronize()
-        aiter_elapsed_gpu_times.append(start_event.elapsed_time(end_event))  # milliseconds
-    aiter_time = sum(aiter_elapsed_gpu_times) / iterations
-   
-    aiter_atomic_elapsed_gpu_times = []
-    for _ in range(iterations):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        model_aiter_atomic(*inputs)
-        end_event.record()
-        torch.cuda.synchronize()
-        aiter_atomic_elapsed_gpu_times.append(start_event.elapsed_time(end_event))  # milliseconds
-    aiter_atomic_time = sum(aiter_atomic_elapsed_gpu_times) / iterations
+        agent_elapsed_gpu_times.append(start_event.elapsed_time(end_event))
+    agent_time = sum(agent_elapsed_gpu_times) / iterations
  
-    print(f"\nOriginal Model avg time: {orig_time:.3f} ms")
-    print(f"New Model (LLM) avg time: {new_time:.3f} ms")
-    print(f"Aiter Model (Aiter) avg time: {aiter_time:.3f} ms")
-    print(f"Aiter Atomic Model (Aiter Atomic) avg time: {aiter_atomic_time:.3f} ms")
-    print(f"Speedup LLM: {orig_time/new_time:.2f}x")
-    print(f"Speedup AITER: {orig_time/aiter_time:.2f}x")
-    print(f"Speedup AITER Atomic: {orig_time/aiter_atomic_time:.2f}x")
+    print("\n" + "=" * 80)
+    print("Performance Summary:")
+    print("=" * 80)
+    print(f"Original Model (PyTorch) avg time:  {orig_time:.3f} ms")
+    print(f"ModelNew (Triton) avg time:         {new_time:.3f} ms")
+    print(f"ModelAgent (AITER) avg time:        {agent_time:.3f} ms")
+    print(f"\nSpeedup Triton vs PyTorch:  {orig_time/new_time:.2f}x")
+    print(f"Speedup AITER vs PyTorch:   {orig_time/agent_time:.2f}x")
+    print(f"Speedup AITER vs Triton:    {new_time/agent_time:.2f}x")
+    print("=" * 80)
  
 if __name__ == "__main__":
+    print("Testing Matrix Multiplication with Transpose Implementations")
+    print("=" * 80)
+    print(f"Configuration:")
+    print(f"  M:             {M}")
+    print(f"  K:             {K}")
+    print(f"  N:             {N}")
+    print("=" * 80)
+    print()
+    
     test_correctness()
+    print()
     test_speed()

@@ -139,9 +139,9 @@ def triton_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 class ModelAgent(nn.Module):
-    # """"""
-    # Optimized batched matrix multiplication using a custom Triton kernel.
-    # """"""
+    """
+    Optimized batched matrix multiplication using a custom Triton kernel.
+    """
     def __init__(self):
         super(ModelAgent, self).__init__()
 
@@ -162,8 +162,10 @@ def get_init_inputs():
     return []
 
 def test_correctness():
+    """Test that all three implementations produce the same results."""
     model_orig = Model().cuda()
     model_new = ModelNew().cuda()
+    model_agent = ModelAgent().cuda()
     
     inputs = get_inputs()
     A, B = inputs
@@ -171,11 +173,14 @@ def test_correctness():
     with torch.no_grad():
         output_orig = model_orig(A, B)
         output_new = model_new(A, B)
+        output_agent = model_agent(A, B)
     
-    checkAllclose(output_orig, output_new, msg="batched_gemm", rtol=1e-2, atol=0.01)
-    print("Correctness test passed!")
+    checkAllclose(output_orig, output_new, msg="batched_gemm (ModelNew)", rtol=1e-2, atol=0.01)
+    checkAllclose(output_orig, output_agent, msg="batched_gemm (ModelAgent)", rtol=1e-2, atol=0.01)
+    print("✓ Correctness test passed for both ModelNew and ModelAgent!")
 
 def test_speed():
+    """Benchmark the performance of all three implementations."""
     model_orig = Model().cuda()
     model_new = ModelNew().cuda()
     model_agent = ModelAgent().cuda()
@@ -186,26 +191,30 @@ def test_speed():
     warmup = 10
     iterations = 100
     
+    # Benchmark Original Model
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_orig(A, B)
         torch.cuda.synchronize()
         
-    # with torch.no_grad():
-    #     with profile(
-    #         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    #         profile_memory=True,
-    #         with_stack=True,
-    #         with_modules=True,
-    #         record_shapes=True,
-    #     ) as prof_orig:
-    #         for _ in range(iterations):
-    #             _ = model_orig(A, B)
-    #         torch.cuda.synchronize()
+    with torch.no_grad():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+            record_shapes=True,
+        ) as prof_orig:
+            for _ in range(iterations):
+                _ = model_orig(A, B)
+            torch.cuda.synchronize()
     
-    print("Original Model:")
+    print("=" * 80)
+    print("Original Model (PyTorch):")
+    print("=" * 80)
     print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    # Benchmark ModelNew (AITER)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_new(A, B)
@@ -223,9 +232,35 @@ def test_speed():
                 _ = model_new(A, B)
             torch.cuda.synchronize()
     
-    print("New Model (AITER):")
+    print("\n" + "=" * 80)
+    print("ModelNew (AITER batched_gemm_bf16_CK):")
+    print("=" * 80)
     print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    # Benchmark ModelAgent (Triton)
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model_agent(A, B)
+        torch.cuda.synchronize()
+        
+    with torch.no_grad():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+            record_shapes=True,
+        ) as prof_agent:
+            for _ in range(iterations):
+                _ = model_agent(A, B)
+            torch.cuda.synchronize()
+    
+    print("\n" + "=" * 80)
+    print("ModelAgent (Triton Fused):")
+    print("=" * 80)
+    print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    
+    # Simple timing measurements
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_orig(A, B)
@@ -256,12 +291,28 @@ def test_speed():
         torch.cuda.synchronize()
         agent_time = (time.time() - start) / iterations
     
-    print(f"\nOriginal Model avg time: {orig_time*1000:.3f} ms")
-    print(f"New Model (AITER) avg time: {new_time*1000:.3f} ms")
-    print(f"Agent Model (LLM) avg time: {agent_time*1000:.3f} ms")
-    print(f"Speedup AITER: {orig_time/new_time:.2f}x")
-    print(f"Speedup LLM: {orig_time/agent_time:.2f}x")
+    print("\n" + "=" * 80)
+    print("Performance Summary:")
+    print("=" * 80)
+    print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
+    print(f"ModelNew (AITER) avg time:          {new_time*1000:.3f} ms")
+    print(f"ModelAgent (Triton) avg time:       {agent_time*1000:.3f} ms")
+    print(f"\nSpeedup AITER vs PyTorch:   {orig_time/new_time:.2f}x")
+    print(f"Speedup Triton vs PyTorch:  {orig_time/agent_time:.2f}x")
+    print(f"Speedup Triton vs AITER:    {new_time/agent_time:.2f}x")
+    print("=" * 80)
 
 if __name__ == "__main__":
+    print("Testing Batched Matrix Multiplication Implementations")
+    print("=" * 80)
+    print(f"Configuration:")
+    print(f"  Batch size:    {batch_size}")
+    print(f"  M:             {m}")
+    print(f"  K:             {k}")
+    print(f"  N:             {n}")
+    print("=" * 80)
+    print()
+    
     test_correctness()
+    print()
     test_speed()

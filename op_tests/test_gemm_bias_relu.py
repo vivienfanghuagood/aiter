@@ -209,6 +209,7 @@ def get_init_inputs():
     return [in_features, out_features, bias_shape]
 
 def test_correctness():
+    """Test that all three implementations produce the same results."""
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
     model_new = ModelNew(*init_inputs).cuda()
@@ -226,9 +227,10 @@ def test_correctness():
     
     checkAllclose(output_orig, output_new, msg="gemm_bias_relu (ModelNew)", rtol=1e-2, atol=0.01)
     checkAllclose(output_orig, output_agent, msg="gemm_bias_relu (ModelAgent)", rtol=1e-2, atol=0.01)
-    print("Correctness test passed for both ModelNew and ModelAgent!")
+    print("✓ Correctness test passed for both ModelNew and ModelAgent!")
 
 def test_speed():
+    """Benchmark the performance of all three implementations."""
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
     model_new = ModelNew(*init_inputs).cuda()
@@ -242,6 +244,7 @@ def test_speed():
     warmup = 10
     iterations = 100
     
+    # Benchmark Original Model
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_orig(x.to(dtypes.fp32))
@@ -259,9 +262,12 @@ def test_speed():
                 _ = model_orig(x.to(dtypes.fp32))
             torch.cuda.synchronize()
     
-    print("Original Model:")
+    print("=" * 80)
+    print("Original Model (PyTorch):")
+    print("=" * 80)
     print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    # Benchmark ModelNew (AITER)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_new(x)
@@ -279,9 +285,12 @@ def test_speed():
                 _ = model_new(x)
             torch.cuda.synchronize()
     
-    print("New Model (AITER):")
+    print("\n" + "=" * 80)
+    print("ModelNew (AITER gemm_a16w16):")
+    print("=" * 80)
     print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    # Benchmark ModelAgent (Triton)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_agent(x)
@@ -299,9 +308,12 @@ def test_speed():
                 _ = model_agent(x)
             torch.cuda.synchronize()
     
-    print("Agent Model (Triton):")
+    print("\n" + "=" * 80)
+    print("ModelAgent (Triton Fused):")
+    print("=" * 80)
     print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    # Simple timing measurements
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_orig(x.to(dtypes.fp32))
@@ -332,12 +344,27 @@ def test_speed():
         torch.cuda.synchronize()
         agent_time = (time.time() - start) / iterations
     
-    print(f"\nOriginal Model avg time: {orig_time*1000:.3f} ms")
-    print(f"New Model (AITER) avg time: {new_time*1000:.3f} ms")
-    print(f"Agent Model (Triton) avg time: {agent_time*1000:.3f} ms")
-    print(f"Speedup AITER: {orig_time/new_time:.2f}x")
-    print(f"Speedup Triton: {orig_time/agent_time:.2f}x")
+    print("\n" + "=" * 80)
+    print("Performance Summary:")
+    print("=" * 80)
+    print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
+    print(f"ModelNew (AITER) avg time:          {new_time*1000:.3f} ms")
+    print(f"ModelAgent (Triton) avg time:       {agent_time*1000:.3f} ms")
+    print(f"\nSpeedup AITER vs PyTorch:   {orig_time/new_time:.2f}x")
+    print(f"Speedup Triton vs PyTorch:  {orig_time/agent_time:.2f}x")
+    print(f"Speedup Triton vs AITER:    {new_time/agent_time:.2f}x")
+    print("=" * 80)
 
 if __name__ == "__main__":
+    print("Testing GEMM + Bias + ReLU Implementations")
+    print("=" * 80)
+    print(f"Configuration:")
+    print(f"  Batch size:    {batch_size}")
+    print(f"  In features:   {in_features}")
+    print(f"  Out features:  {out_features}")
+    print("=" * 80)
+    print()
+    
     test_correctness()
+    print()
     test_speed()

@@ -1,0 +1,88 @@
+merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv
+merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_enum] under /app/aiter/aiter/jit/module_aiter_enum.so
+Testing Swish Activation Implementations
+================================================================================
+Configuration:
+  Batch size:    4096
+  Dimension:     393216
+================================================================================
+
+[aiter] import [module_aiter_unary] under /app/aiter/aiter/jit/module_aiter_unary.so
+[aiter] type hints mismatch, override to --> sigmoid(arg0: torch.Tensor) -> torch.Tensor
+[aiter] import [module_aiter_mul_float16_float16] under /app/aiter/aiter/jit/module_aiter_mul_float16_float16.so
+[aiter] type hints mismatch, override to --> mul(arg0: torch.Tensor, arg1: torch.Tensor) -> torch.Tensor
+[aiter] swish (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] swish (ModelAgent)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+✓ Correctness test passed for both ModelNew and ModelAgent!
+
+[W1112 12:14:51.589612294 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+================================================================================
+Original Model (PyTorch):
+================================================================================
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              aten::mul         0.09%     409.370us         0.23%       1.072ms      10.716us     252.117ms        52.95%     252.117ms       2.521ms           0 B           0 B     300.00 GB     300.00 GB           100  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us     252.117ms        52.95%     252.117ms       1.261ms           0 B           0 B           0 B           0 B           200  
+                                          aten::sigmoid         0.09%     425.466us         0.24%       1.121ms      11.207us     224.036ms        47.05%     224.036ms       2.240ms           0 B           0 B     300.00 GB     300.00 GB           100  
+void at::native::vectorized_elementwise_kernel<8, at...         0.00%       0.000us         0.00%       0.000us       0.000us     224.036ms        47.05%     224.036ms       1.120ms           0 B           0 B           0 B           0 B           200  
+                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -600.00 GB    -600.00 GB           200  
+                                        hipLaunchKernel         0.29%       1.357ms         0.29%       1.357ms       3.394us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           400  
+                                   hipDeviceSynchronize        99.54%     473.389ms        99.54%     473.389ms     236.694ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 475.581ms
+Self CUDA time total: 476.154ms
+
+
+================================================================================
+ModelNew (AITER sigmoid + mul):
+================================================================================
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                             aiter::mul         0.19%     931.387us         0.30%       1.469ms      14.693us     281.292ms        56.49%     281.292ms       2.813ms           0 B           0 B     300.00 GB           0 B           100  
+void aiter::operator_contiguous_kernel_naive<c10::Ha...         0.00%       0.000us         0.00%       0.000us       0.000us     281.292ms        56.49%     281.292ms       2.813ms           0 B           0 B           0 B           0 B           100  
+                                         aiter::sigmoid         0.13%     644.517us         0.23%       1.133ms      11.332us     216.626ms        43.51%     216.626ms       2.166ms           0 B           0 B     300.00 GB           0 B           100  
+void aiter::unary_operator_tile_kernel<c10::Half, 8,...         0.00%       0.000us         0.00%       0.000us       0.000us     216.626ms        43.51%     216.626ms       2.166ms           0 B           0 B           0 B           0 B           100  
+                                   hipDeviceSynchronize        99.48%     494.479ms        99.48%     494.479ms     247.240ms       2.787ms         0.56%       2.787ms       1.394ms           0 B           0 B           0 B           0 B             2  
+                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -600.00 GB    -600.00 GB           200  
+                                            aten::empty         0.06%     297.691us         0.06%     297.691us       1.488us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     600.00 GB     600.00 GB           200  
+                                        hipLaunchKernel         0.13%     642.844us         0.13%     642.844us       3.214us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           200  
+                                    aten::promote_types         0.01%      43.373us         0.01%      43.373us       0.434us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+                            hipGetDevicePropertiesR0600         0.01%      26.654us         0.01%      26.654us       0.267us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 497.082ms
+Self CUDA time total: 497.918ms
+
+
+================================================================================
+ModelAgent (Triton Fused):
+================================================================================
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+              swish_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     219.591ms       100.00%     219.591ms       2.196ms           0 B           0 B           0 B           0 B           100  
+                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -300.00 GB    -300.00 GB           100  
+          aten::empty_like         0.06%     125.431us         0.13%     274.088us       2.741us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     300.00 GB           0 B           100  
+       aten::empty_strided         0.07%     148.657us         0.07%     148.657us       1.487us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     300.00 GB     300.00 GB           100  
+    hipPointerGetAttribute         0.01%      30.155us         0.01%      30.155us       0.151us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           200  
+     hipModuleLaunchKernel         0.15%     314.915us         0.15%     314.915us       3.149us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+      hipDeviceSynchronize        99.71%     214.168ms        99.71%     214.168ms     107.084ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 214.787ms
+Self CUDA time total: 219.591ms
+
+
+================================================================================
+Performance Summary:
+================================================================================
+Original Model (PyTorch) avg time:  4.791 ms
+ModelNew (AITER) avg time:          4.993 ms
+ModelAgent (Triton) avg time:       2.217 ms
+
+Speedup AITER vs PyTorch:   0.96x
+Speedup Triton vs PyTorch:  2.16x
+Speedup Triton vs AITER:    2.25x
+================================================================================

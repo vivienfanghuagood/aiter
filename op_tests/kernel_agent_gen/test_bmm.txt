@@ -1,0 +1,94 @@
+merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv
+merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_enum] under /app/aiter/aiter/jit/module_aiter_enum.so
+Testing Batched Matrix Multiplication Implementations
+================================================================================
+Configuration:
+  Batch size:    128
+  M:             512
+  K:             1024
+  N:             2048
+================================================================================
+
+[aiter] shape is B:128, M:512, N:2048, K:1024 dtype is bf16, not found tuned config in CKGEMM, will use default config!
+[aiter] import [module_batched_gemm_bf16] under /app/aiter/aiter/jit/module_batched_gemm_bf16.so
+[aiter] type hints mismatch, override to --> batched_gemm_bf16(XQ: torch.Tensor, WQ: torch.Tensor, Out: torch.Tensor, bias: Optional[torch.Tensor] = None, splitK: int = 0) -> torch.Tensor
+[aiter] batched_gemm (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+    a    : torch.Size([128, 512, 2048])
+           tensor([254., 250., 268., 255., 247., 258., 260., 258.], device='cuda:0')
+    b    : torch.Size([128, 512, 2048])
+           tensor([251., 243., 249., 244., 251., 244., 253., 245.], device='cuda:0')
+    delta:
+           tensor([ 3.,  7., 19., 11.,  4., 14.,  7., 13.], device='cuda:0')
+[aiter] -->max abs delta:43.0, delta details: 72.6% (97438536 of 134217728) elements
+[aiter] batched_gemm (ModelAgent)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+✓ Correctness test passed for both ModelNew and ModelAgent!
+
+[W1112 12:50:09.768549595 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+================================================================================
+Original Model (PyTorch):
+================================================================================
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              aten::bmm         2.31%       1.365ms         3.03%       1.787ms      17.870us      59.407ms       100.00%      59.407ms     594.067us           0 B           0 B      25.00 GB      25.00 GB           100  
+Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x1...         0.00%       0.000us         0.00%       0.000us       0.000us      59.407ms       100.00%      59.407ms     594.067us           0 B           0 B           0 B           0 B           100  
+                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     -25.00 GB     -25.00 GB           100  
+                            hipGetDevicePropertiesR0600         0.12%      71.626us         0.12%      71.626us       0.239us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           300  
+                               hipExtModuleLaunchKernel         0.59%     350.731us         0.59%     350.731us       3.507us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+                                   hipDeviceSynchronize        96.97%      57.247ms        96.97%      57.247ms      28.624ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 59.034ms
+Self CUDA time total: 59.407ms
+
+
+================================================================================
+ModelNew (AITER batched_gemm_bf16_CK):
+================================================================================
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                               aiter::batched_gemm_bf16         1.32%     963.397us         2.11%       1.535ms      15.345us      73.870ms       100.00%      73.870ms     738.702us           0 B           0 B           0 B           0 B           100  
+void ck::kernel_batched_gemm_xdl_cshuffle_v3_multi_d...         0.00%       0.000us         0.00%       0.000us       0.000us      73.870ms       100.00%      73.870ms     738.702us           0 B           0 B           0 B           0 B           100  
+                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     -25.00 GB     -25.00 GB           100  
+                                        aten::transpose         0.25%     179.181us         0.34%     247.404us       2.474us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+                                       aten::as_strided         0.09%      68.223us         0.09%      68.223us       0.682us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+                                            aten::empty         0.23%     163.889us         0.23%     163.889us       1.639us       0.000us         0.00%       0.000us       0.000us           0 B           0 B      25.00 GB      25.00 GB           100  
+                            hipGetDevicePropertiesR0600         0.29%     211.790us         0.29%     211.790us       0.193us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B          1100  
+                                  hipDeviceGetAttribute         0.05%      36.204us         0.05%      36.204us       0.181us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           200  
+                                        hipLaunchKernel         0.44%     323.116us         0.44%     323.116us       3.231us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+                                   hipDeviceSynchronize        97.33%      70.856ms        97.33%      70.856ms      35.428ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 72.802ms
+Self CUDA time total: 73.870ms
+
+
+================================================================================
+ModelAgent (Triton Fused):
+================================================================================
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                bmm_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      85.253ms       100.00%      85.253ms     852.532us           0 B           0 B           0 B           0 B           100  
+                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     -50.00 GB     -50.00 GB           100  
+               aten::empty         0.26%     185.195us         0.26%     185.195us       1.852us       0.000us         0.00%       0.000us       0.000us           0 B           0 B      50.00 GB      50.00 GB           100  
+    hipPointerGetAttribute         0.06%      40.402us         0.06%      40.402us       0.135us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           300  
+     hipModuleLaunchKernel         0.46%     324.500us         0.46%     324.500us       3.245us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
+      hipDeviceSynchronize        99.23%      70.431ms        99.23%      70.431ms      35.216ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
+--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 70.981ms
+Self CUDA time total: 85.253ms
+
+
+================================================================================
+Performance Summary:
+================================================================================
+Original Model (PyTorch) avg time:  0.577 ms
+ModelNew (AITER) avg time:          0.737 ms
+ModelAgent (Triton) avg time:       0.854 ms
+
+Speedup AITER vs PyTorch:   0.78x
+Speedup Triton vs PyTorch:  0.68x
+Speedup Triton vs AITER:    0.86x
+================================================================================

@@ -2,7 +2,7 @@
 
 ## 1. Performance Summary Table
 
-| Test Case | Model (PyTorch) | ModelNew (AITER) | ModelAgent (Triton) | AITER vs PyTorch | Triton vs PyTorch | Triton vs AITER |
+| Test Case | Model (PyTorch) | ModelAiter (AITER) | ModelNew (Triton) | AITER vs PyTorch | Triton vs PyTorch | Triton vs AITER |
 |-----------|-----------------|------------------|---------------------|------------------|-------------------|-----------------|
 | **test_bmm(level1_3)** | 0.577 ms | 0.737 ms | 0.854 ms | 0.78x (slower) | 0.68x (slower) | 0.86x (slower) |
 | **test_gelu_and_mul** | 3.050 ms | 1.315 ms | 0.988 ms | **2.32x faster** | **3.09x faster** | **1.33x faster** |
@@ -23,13 +23,13 @@
 - CUDA Time: 59.407ms (100 iterations)
 - Average: 0.577 ms/iteration
 
-**ModelNew (AITER)**:
+**ModelAiter (AITER)**:
 - Kernel: `kernel_batched_gemm_xdl_cshuffle_v3_multi_d` (CK batched GEMM)
 - CUDA Time: 73.870ms (100 iterations)
 - Average: 0.737 ms/iteration
 - **Result**: 0.78x (slower than PyTorch)
 
-**ModelAgent (Triton)**:
+**ModelNew (Triton)**:
 - Kernel: `bmm_kernel` (custom Triton kernel)
 - CUDA Time: 85.253ms (100 iterations)
 - Average: 0.854 ms/iteration
@@ -51,13 +51,13 @@
 - Total CUDA Time: 462.945ms (100 iterations)
 - Average: 3.050 ms/iteration
 
-**ModelNew (AITER)**:
+**ModelAiter (AITER)**:
 - Kernel: `act_and_mul_kernel` (fused gelu+mul)
 - CUDA Time: 130.641ms (100 iterations)
 - Average: 1.315 ms/iteration
 - **Result**: 2.32x speedup vs PyTorch
 
-**ModelAgent (Triton)**:
+**ModelNew (Triton)**:
 - Kernel: `gelu_and_mul_kernel` (fused Triton kernel)
 - CUDA Time: 98.640ms (100 iterations)
 - Average: 0.988 ms/iteration
@@ -82,13 +82,13 @@
 - Total CUDA Time: 130.101ms (100 iterations)
 - Average: 1.295 ms/iteration
 
-**ModelNew (AITER)**:
+**ModelAiter (AITER)**:
 - Kernel: `gemm_a16_w16_kernel` (fused GEMM+bias+relu)
 - CUDA Time: 36.088ms (100 iterations)
 - Average: 0.360 ms/iteration
 - **Result**: 3.60x speedup vs PyTorch
 
-**ModelAgent (Triton)**:
+**ModelNew (Triton)**:
 - Kernel: `matmul_bias_relu_kernel` (fused Triton kernel)
 - CUDA Time: 40.862ms (100 iterations)
 - Average: 0.399 ms/iteration
@@ -113,14 +113,14 @@
 - Total CUDA Time: 73.672ms (100 iterations)
 - Average: 0.731 ms/iteration
 
-**ModelNew (AITER)**:
+**ModelAiter (AITER)**:
 - GEMM: 13.160ms (89.27%)
 - `gelu_and_mul` kernel: 1.582ms (10.73%)
 - Total CUDA Time: 14.742ms (100 iterations)
 - Average: 0.141 ms/iteration
 - **Result**: 5.18x speedup vs PyTorch (best result across all tests)
 
-**ModelAgent (Triton)**:
+**ModelNew (Triton)**:
 - Kernel: `matmul_gelu_mul_kernel` (fully fused kernel)
 - CUDA Time: 24.420ms (100 iterations)
 - Average: 0.247 ms/iteration
@@ -144,14 +144,14 @@
 - Total CUDA Time: 476.154ms (100 iterations)
 - Average: 4.791 ms/iteration
 
-**ModelNew (AITER)**:
+**ModelAiter (AITER)**:
 - Sigmoid kernel: 216.626ms (43.51%)
 - Mul kernel: 281.292ms (56.49%)
 - Total CUDA Time: 497.918ms (100 iterations)
 - Average: 4.993 ms/iteration
 - **Result**: 0.96x (slightly slower than PyTorch)
 
-**ModelAgent (Triton)**:
+**ModelNew (Triton)**:
 - Kernel: `swish_kernel` (fused sigmoid+mul)
 - CUDA Time: 219.591ms (100 iterations)
 - Average: 2.217 ms/iteration

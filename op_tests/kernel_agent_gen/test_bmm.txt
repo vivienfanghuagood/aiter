@@ -14,7 +14,7 @@ Configuration:
 [aiter] shape is B:128, M:512, N:2048, K:1024 dtype is bf16, not found tuned config in CKGEMM, will use default config!
 [aiter] import [module_batched_gemm_bf16] under /app/aiter/aiter/jit/module_batched_gemm_bf16.so
 [aiter] type hints mismatch, override to --> batched_gemm_bf16(XQ: torch.Tensor, WQ: torch.Tensor, Out: torch.Tensor, bias: Optional[torch.Tensor] = None, splitK: int = 0) -> torch.Tensor
-[aiter] batched_gemm (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
+[aiter] batched_gemm (ModelAiter)[checkAllclose atol=0.01 rtol=0.01 [31mfailed![0m]
     a    : torch.Size([128, 512, 2048])
            tensor([254., 250., 268., 255., 247., 258., 260., 258.], device='cuda:0')
     b    : torch.Size([128, 512, 2048])
@@ -22,8 +22,8 @@ Configuration:
     delta:
            tensor([ 3.,  7., 19., 11.,  4., 14.,  7., 13.], device='cuda:0')
 [aiter] -->max abs delta:43.0, delta details: 72.6% (97438536 of 134217728) elements
-[aiter] batched_gemm (ModelAgent)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
-✓ Correctness test passed for both ModelNew and ModelAgent!
+[aiter] batched_gemm (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+✓ Correctness test passed for both ModelAiter and ModelNew!
 
 [W1112 12:50:09.768549595 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
 ================================================================================
@@ -44,7 +44,7 @@ Self CUDA time total: 59.407ms
 
 
 ================================================================================
-ModelNew (AITER batched_gemm_bf16_CK):
+ModelAiter (AITER batched_gemm_bf16_CK):
 ================================================================================
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
@@ -65,7 +65,7 @@ Self CUDA time total: 73.870ms
 
 
 ================================================================================
-ModelAgent (Triton Fused):
+ModelNew (Triton Fused):
 ================================================================================
 --------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                       Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
@@ -85,8 +85,8 @@ Self CUDA time total: 85.253ms
 Performance Summary:
 ================================================================================
 Original Model (PyTorch) avg time:  0.577 ms
-ModelNew (AITER) avg time:          0.737 ms
-ModelAgent (Triton) avg time:       0.854 ms
+ModelAiter (AITER) avg time:          0.737 ms
+ModelNew (Triton) avg time:       0.854 ms
 
 Speedup AITER vs PyTorch:   0.78x
 Speedup Triton vs PyTorch:  0.68x

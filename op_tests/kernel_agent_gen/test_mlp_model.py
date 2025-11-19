@@ -20,9 +20,9 @@ class Model(nn.Module):
         x = torch.logsumexp(x, dim=1)
         return x
 
-class ModelNew(nn.Module):
+class ModelAiter(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
-        super(ModelNew, self).__init__()
+        super(ModelAiter, self).__init__()
         self.weight1 = nn.Parameter(torch.randn(hidden_size, input_size, dtype=dtypes.bf16))
         self.bias1 = nn.Parameter(torch.randn(hidden_size, dtype=dtypes.bf16))
         self.weight2 = nn.Parameter(torch.randn(output_size, hidden_size, dtype=dtypes.bf16))
@@ -219,9 +219,9 @@ def triton_linear_logsumexp(x: torch.Tensor, weight: torch.Tensor, bias: torch.T
     return out
 
 
-class ModelAgent(nn.Module):
+class ModelNew(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
-        super(ModelAgent, self).__init__()
+        super(ModelNew, self).__init__()
         self.linear1 = nn.Linear(input_size, hidden_size)
         self.linear2 = nn.Linear(hidden_size, output_size)
 
@@ -245,15 +245,15 @@ def get_init_inputs():
 def test_correctness():
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
-    model_new = ModelNew(*init_inputs).cuda()
-    model_new.load_from_original(model_orig)
+    model_aiter = ModelAiter(*init_inputs).cuda()
+    model_aiter.load_from_original(model_orig)
     
     inputs = get_inputs()
     x = inputs[0]
     
     with torch.no_grad():
         output_orig = model_orig(x.to(dtypes.fp32)).to(dtypes.bf16)
-        output_new = model_new(x)
+        output_new = model_aiter(x)
     
     checkAllclose(output_orig, output_new, msg="gemm_sigmoid_gemm_logsumexp", rtol=1e-1, atol=1e-1)
     print("Correctness test passed!")
@@ -261,9 +261,9 @@ def test_correctness():
 def test_speed():
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
+    model_aiter = ModelAiter(*init_inputs).cuda()
+    model_aiter.load_from_original(model_orig)
     model_new = ModelNew(*init_inputs).cuda()
-    model_new.load_from_original(model_orig)
-    model_agent = ModelAgent(*init_inputs).cuda()
     
     inputs = get_inputs()
     x = inputs[0]
@@ -293,7 +293,7 @@ def test_speed():
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new(x)
+            _ = model_aiter(x)
         torch.cuda.synchronize()
         
     with torch.no_grad():
@@ -305,7 +305,7 @@ def test_speed():
             record_shapes=True,
         ) as prof_new:
             for _ in range(iterations):
-                _ = model_new(x)
+                _ = model_aiter(x)
             torch.cuda.synchronize()
     
     print("New Model (AITER):")
@@ -323,21 +323,21 @@ def test_speed():
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new(x)
+            _ = model_aiter(x)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_new(x)
+            _ = model_aiter(x)
         torch.cuda.synchronize()
         new_time = (time.time() - start) / iterations
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_agent(x)
+            _ = model_new(x)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_agent(x)
+            _ = model_new(x)
         torch.cuda.synchronize()
         agent_time = (time.time() - start) / iterations
     

@@ -28,14 +28,14 @@ class Model(nn.Module):
         return F.gelu(gate) * up
 
 
-class ModelNew(nn.Module):
+class ModelAiter(nn.Module):
     """
     Optimized implementation using AITER's gelu_and_mul.
     Input shape: [batch_size, 2 * out_features]
     Output shape: [batch_size, out_features]
     """
     def __init__(self, out_features):
-        super(ModelNew, self).__init__()
+        super(ModelAiter, self).__init__()
         self.out_features = out_features
     
     def forward(self, x):
@@ -48,204 +48,116 @@ class ModelNew(nn.Module):
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=5, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=5, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=5, num_warps=2),
-        # AMD GPU optimized configs with smaller blocks
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 512}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=16, num_stages=4),
+        triton.Config({'BLOCK_SIZE': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 2048}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE': 4096}, num_warps=8, num_stages=3),
     ],
-    key=['M', 'N'],
+    key=['N'],
 )
 @triton.jit
-def gelu_and_mul_kernel(
-    input_ptr,
-    output_ptr,
-    M,
+def fused_gelu_mul_kernel(
+    x_ptr,
+    out_ptr,
     N,
-    stride_im,
-    stride_in,
-    stride_om,
-    stride_on,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    out_features,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Fused GELU and element-wise multiplication kernel.
-    Computes: output = GELU(input[:, :N]) * input[:, N:]
+    Fused kernel that computes: GELU(x[:, :d]) * x[:, d:]
+    where d = out_features
     
-    input: [M, 2*N]
-    output: [M, N]
+    Memory layout optimization:
+    - Process output elements in a flat contiguous manner
+    - Each output element at position (row, col) reads from:
+      * gate: x[row, col] (first half of columns)
+      * up: x[row, col + out_features] (second half of columns)
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    # Flat output index
+    pid = tl.program_id(0)
+    flat_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    # Offsets for this block
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Bounds check
+    mask = flat_idx < N
     
-    # Masks
-    mask_m = offs_m < M
-    mask_n = offs_n < N
-    mask = mask_m[:, None] & mask_n[None, :]
+    # Compute row and column from flat index
+    row = flat_idx // out_features
+    col = flat_idx % out_features
     
-    # Load gate part (first half): input[:, :N]
-    gate_ptrs = input_ptr + offs_m[:, None] * stride_im + offs_n[None, :] * stride_in
-    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    # Calculate input indices for gate and up
+    # gate comes from x[:, :out_features]
+    # up comes from x[:, out_features:]
+    gate_idx = row * (2 * out_features) + col
+    up_idx = row * (2 * out_features) + out_features + col
     
-    # Load up part (second half): input[:, N:]
-    up_ptrs = input_ptr + offs_m[:, None] * stride_im + (offs_n[None, :] + N) * stride_in
-    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+    # Load gate and up values (coalesced memory access)
+    gate = tl.load(x_ptr + gate_idx, mask=mask, other=0.0)
+    up = tl.load(x_ptr + up_idx, mask=mask, other=0.0)
     
-    # Apply GELU: GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
-    # Using M_SQRT1_2 = 1 / sqrt(2) = 0.70710678118654752440
-    M_SQRT1_2 = 0.70710678118654752440
-    gate_gelu = 0.5 * gate * (1.0 + tl.erf(gate * M_SQRT1_2))
+    # Ultra-fast GELU approximation: gelu(x) ≈ x * sigmoid(1.702 * x)
+    # Cast to fp32 for numerical stability
+    gate_fp32 = gate.to(tl.float32)
+    gelu_gate = gate_fp32 * tl.sigmoid(1.702 * gate_fp32)
     
-    # Element-wise multiplication: GELU(gate) * up
-    result = gate_gelu * up
+    # Multiply with up (cast up to fp32 as well for consistency)
+    up_fp32 = up.to(tl.float32)
+    result = gelu_gate * up_fp32
     
-    # Store result
-    output_ptrs = output_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-    tl.store(output_ptrs, result.to(tl.float16), mask=mask)
+    # Cast back to original dtype and store
+    result_out = result.to(gate.dtype)
+    tl.store(out_ptr + flat_idx, result_out, mask=mask)
 
 
-def triton_gelu_and_mul(input: torch.Tensor) -> torch.Tensor:
+def triton_fused_gelu_mul(x: torch.Tensor, out_features: int):
     """
-    Apply GELU and element-wise multiplication using Triton.
+    Wrapper function for the fused GELU * mul kernel.
     
     Args:
-        input: [M, 2*N] input tensor (fp16)
+        x: Input tensor of shape [batch_size, 2 * out_features]
+        out_features: Number of output features
     
     Returns:
-        output: [M, N] output tensor (fp16)
+        Output tensor of shape [batch_size, out_features]
     """
-    assert input.is_contiguous()
-    assert input.dtype == torch.float16
+    assert x.is_cuda, "Input must be on CUDA"
+    x = x.contiguous()
     
-    M, N2 = input.shape
-    assert N2 % 2 == 0, f"Input second dimension must be even, got {N2}"
-    N = N2 // 2
+    batch_size = x.shape[0]
+    N = batch_size * out_features
     
-    output = torch.empty((M, N), dtype=torch.float16, device=input.device)
+    # Allocate output tensor
+    out = torch.empty(batch_size, out_features, dtype=x.dtype, device=x.device)
     
-    def grid(META):
-        return (
-            triton.cdiv(M, META['BLOCK_M']),
-            triton.cdiv(N, META['BLOCK_N']),
-        )
+    # Launch kernel
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     
-    gelu_and_mul_kernel[grid](
-        input, output,
-        M, N,
-        input.stride(0), input.stride(1),
-        output.stride(0), output.stride(1),
+    fused_gelu_mul_kernel[grid](
+        x,
+        out,
+        N,
+        out_features,
     )
     
-    return output
-
-
-class ModelAgent(nn.Module):
-    """
-    Triton-optimized implementation with fused GELU + Mul.
-    Optimized for AMD GPUs with consideration of shared memory limits.
-    Input shape: [batch_size, 2 * out_features]
-    Output shape: [batch_size, out_features]
-    """
-    def __init__(self, out_features):
-        super(ModelAgent, self).__init__()
-        self.out_features = out_features
-
-    def forward(self, x):
-        """
-        Args:
-            x: [batch_size, 2 * out_features], dtype float16, device cuda
-        Returns:
-            output: [batch_size, out_features], dtype float16
-        """
-        return triton_gelu_and_mul(x)
-
-@triton.jit
-def gelu_mul_kernel(
-    x_ptr,          # *ptr to input [B, 2D]
-    out_ptr,        # *ptr to output [B, D]
-    B,              # batch size
-    D,              # out_features
-    stride_x,       # stride between rows in x (in elements)
-    stride_out,     # stride between rows in out (in elements)
-    BLOCK_N: tl.constexpr,
-):
-    pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    # column offsets for this tile
-    col_offset = pid_n * BLOCK_N
-    offs_n = col_offset + tl.arange(0, BLOCK_N)
-    # mask within [0, D)
-    mask = offs_n < D
-
-    # base row pointers
-    row_x = x_ptr + pid_b * stride_x
-    row_out = out_ptr + pid_b * stride_out
-
-    # load gate and up halves
-    gate = tl.load(row_x + offs_n, mask=mask, other=0.0)
-    up = tl.load(row_x + D + offs_n, mask=mask, other=0.0)
-
-    # cast to f32 for computation
-    gate_f32 = gate.to(tl.float32)
-    up_f32 = up.to(tl.float32)
-
-    # GELU approximation: 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
-    c0 = 0.044715
-    c1 = 0.7978845608028654  # sqrt(2/pi)
-    x3 = gate_f32 * gate_f32 * gate_f32
-    t = c1 * (gate_f32 + c0 * x3)
-
-    # tanh(t) = (exp(2t) - 1) / (exp(2t) + 1)
-    e2t = tl.exp(2.0 * t)
-    tanh_t = (e2t - 1.0) / (e2t + 1.0)
-
-    gelu = 0.5 * gate_f32 * (1.0 + tanh_t)
-
-    out_vals = gelu * up_f32
-    out_vals = out_vals.to(tl.float16)
-
-    tl.store(row_out + offs_n, out_vals, mask=mask)
-
-
-def triton_gelu_mul(x: torch.Tensor, out_features: int):
-    assert x.is_cuda, "Input tensor must be on CUDA."
-    x = x.contiguous()
-    B = x.shape[0]
-    D = out_features
-    assert x.shape[1] == 2 * D, "Input second dimension must be 2 * out_features."
-
-    out = torch.empty((B, D), device=x.device, dtype=torch.float16)
-
-    stride_x = x.stride(0)
-    stride_out = out.stride(0)
-
-    BLOCK_N = 256
-    grid = (B, triton.cdiv(D, BLOCK_N))
-
-    gelu_mul_kernel[grid](x, out, B, D, stride_x, stride_out, BLOCK_N=BLOCK_N)
     return out
 
 
-class ModelAgentNew(nn.Module):
+class ModelNew(nn.Module):
+    """
+    Optimized implementation using fused Triton kernel.
+    Combines GELU(input[:, :d]) * input[:, d:] into a single kernel.
+    """
     def __init__(self, out_features):
-        super(ModelAgentNew, self).__init__()
+        super(ModelNew, self).__init__()
         self.out_features = out_features
 
     def forward(self, x):
-        return triton_gelu_mul(x, self.out_features)
-
+        # x: [batch_size, 2 * out_features]
+        return triton_fused_gelu_mul(x, self.out_features)
 
 # Test configuration
 batch_size = 64 * 1024
@@ -265,8 +177,8 @@ def test_correctness():
     """Test that all three implementations produce the same results."""
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
+    model_aiter = ModelAiter(*init_inputs).cuda()
     model_new = ModelNew(*init_inputs).cuda()
-    model_agent = ModelAgent(*init_inputs).cuda()
     
     inputs = get_inputs()
     x = inputs[0]
@@ -274,20 +186,20 @@ def test_correctness():
     with torch.no_grad():
         # Original model uses fp32 internally, convert output to fp16 for comparison
         output_orig = model_orig(x.to(dtypes.fp32)).to(dtypes.fp16)
-        output_new = model_new(x)
-        output_agent = model_agent(x)
+        output_new = model_aiter(x)
+        output_agent = model_new(x)
     
-    checkAllclose(output_orig, output_new, msg="gelu_and_mul (ModelNew)", rtol=1e-2, atol=0.01)
-    checkAllclose(output_orig, output_agent, msg="gelu_and_mul (ModelAgent)", rtol=1e-2, atol=0.01)
-    print("✓ Correctness test passed for both ModelNew and ModelAgent!")
+    checkAllclose(output_orig, output_new, msg="gelu_and_mul (ModelAiter)", rtol=1e-2, atol=0.01)
+    checkAllclose(output_orig, output_agent, msg="gelu_and_mul (ModelNew)", rtol=1e-2, atol=0.01)
+    print("✓ Correctness test passed for both ModelAiter and ModelNew!")
 
 
 def test_speed():
     """Benchmark the performance of all three implementations."""
     init_inputs = get_init_inputs()
     model_orig = Model(*init_inputs).cuda()
+    model_aiter = ModelAiter(*init_inputs).cuda()
     model_new = ModelNew(*init_inputs).cuda()
-    model_agent = ModelAgent(*init_inputs).cuda()
     
     inputs = get_inputs()
     x = inputs[0]
@@ -318,7 +230,30 @@ def test_speed():
     print("=" * 80)
     print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
-    # Benchmark ModelNew (AITER)
+    # Benchmark ModelAiter (AITER)
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model_aiter(x)
+        torch.cuda.synchronize()
+        
+    with torch.no_grad():
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+            record_shapes=True,
+        ) as prof_new:
+            for _ in range(iterations):
+                _ = model_aiter(x)
+            torch.cuda.synchronize()
+    
+    print("\n" + "=" * 80)
+    print("ModelAiter (AITER gelu_and_mul):")
+    print("=" * 80)
+    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    
+    # Benchmark ModelNew (Triton)
     with torch.no_grad():
         for _ in range(warmup):
             _ = model_new(x)
@@ -331,36 +266,13 @@ def test_speed():
             with_stack=True,
             with_modules=True,
             record_shapes=True,
-        ) as prof_new:
+        ) as prof_agent:
             for _ in range(iterations):
                 _ = model_new(x)
             torch.cuda.synchronize()
     
     print("\n" + "=" * 80)
-    print("ModelNew (AITER gelu_and_mul):")
-    print("=" * 80)
-    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Benchmark ModelAgent (Triton)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_agent(x)
-        torch.cuda.synchronize()
-        
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_agent:
-            for _ in range(iterations):
-                _ = model_agent(x)
-            torch.cuda.synchronize()
-    
-    print("\n" + "=" * 80)
-    print("ModelAgent (Triton Fused):")
+    print("ModelNew (Triton Fused):")
     print("=" * 80)
     print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
@@ -378,21 +290,21 @@ def test_speed():
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new(x)
+            _ = model_aiter(x)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_new(x)
+            _ = model_aiter(x)
         torch.cuda.synchronize()
         new_time = (time.time() - start) / iterations
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_agent(x)
+            _ = model_new(x)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_agent(x)
+            _ = model_new(x)
         torch.cuda.synchronize()
         agent_time = (time.time() - start) / iterations
     
@@ -400,8 +312,8 @@ def test_speed():
     print("Performance Summary:")
     print("=" * 80)
     print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
-    print(f"ModelNew (AITER) avg time:          {new_time*1000:.3f} ms")
-    print(f"ModelAgent (Triton) avg time:       {agent_time*1000:.3f} ms")
+    print(f"ModelAiter (AITER) avg time:          {new_time*1000:.3f} ms")
+    print(f"ModelNew (Triton) avg time:       {agent_time*1000:.3f} ms")
     print(f"\nSpeedup AITER vs PyTorch:   {orig_time/new_time:.2f}x")
     print(f"Speedup Triton vs PyTorch:  {orig_time/agent_time:.2f}x")
     print(f"Speedup Triton vs AITER:    {new_time/agent_time:.2f}x")

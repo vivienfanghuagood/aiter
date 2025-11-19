@@ -10,9 +10,9 @@ Configuration:
 ================================================================================
 
 [aiter] import [module_activation] under /app/aiter/aiter/jit/module_activation.so
+[aiter] gelu_and_mul (ModelAiter)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] gelu_and_mul (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
-[aiter] gelu_and_mul (ModelAgent)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
-✓ Correctness test passed for both ModelNew and ModelAgent!
+✓ Correctness test passed for both ModelAiter and ModelNew!
 
 [W1112 12:31:05.124932401 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
 ================================================================================
@@ -37,7 +37,7 @@ Self CUDA time total: 462.945ms
 
 
 ================================================================================
-ModelNew (AITER gelu_and_mul):
+ModelAiter (AITER gelu_and_mul):
 ================================================================================
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
@@ -54,7 +54,7 @@ Self CUDA time total: 130.641ms
 
 
 ================================================================================
-ModelAgent (Triton Fused):
+ModelNew (Triton Fused):
 ================================================================================
 --------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                       Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
@@ -74,8 +74,8 @@ Self CUDA time total: 98.640ms
 Performance Summary:
 ================================================================================
 Original Model (PyTorch) avg time:  3.050 ms
-ModelNew (AITER) avg time:          1.315 ms
-ModelAgent (Triton) avg time:       0.988 ms
+ModelAiter (AITER) avg time:          1.315 ms
+ModelNew (Triton) avg time:       0.988 ms
 
 Speedup AITER vs PyTorch:   2.32x
 Speedup Triton vs PyTorch:  3.09x

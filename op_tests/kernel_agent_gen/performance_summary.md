@@ -4,11 +4,11 @@
 
 | Test Case | Model (PyTorch) | ModelNew (AITER) | ModelAgent (Triton) | AITER vs PyTorch | Triton vs PyTorch | Triton vs AITER |
 |-----------|-----------------|------------------|---------------------|------------------|-------------------|-----------------|
-| **test_bmm** | 0.577 ms | 0.737 ms | 0.854 ms | 0.78x (slower) | 0.68x (slower) | 0.86x (slower) |
+| **test_bmm(level1_3)** | 0.577 ms | 0.737 ms | 0.854 ms | 0.78x (slower) | 0.68x (slower) | 0.86x (slower) |
 | **test_gelu_and_mul** | 3.050 ms | 1.315 ms | 0.988 ms | **2.32x faster** | **3.09x faster** | **1.33x faster** |
-| **test_gemm_bias_relu** | 1.295 ms | 0.360 ms | 0.399 ms | **3.60x faster** | **3.25x faster** | 0.90x (slower) |
+| **test_gemm_bias_relu(level2_76)** | 1.295 ms | 0.360 ms | 0.399 ms | **3.60x faster** | **3.25x faster** | 0.90x (slower) |
 | **test_mlp** | 0.731 ms | 0.141 ms | 0.247 ms | **5.18x faster** | **2.95x faster** | 0.57x (slower) |
-| **test_swish** | 4.791 ms | 4.993 ms | 2.217 ms | 0.96x (slower) | **2.16x faster** | **2.25x faster** |
+| **test_swish(level1_25)** | 4.791 ms | 4.993 ms | 2.217 ms | 0.96x (slower) | **2.16x faster** | **2.25x faster** |
 
 ---
 

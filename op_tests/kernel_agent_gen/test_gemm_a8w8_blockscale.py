@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import aiter
-from aiter import dtypes
 from aiter.test_common import checkAllclose
 from torch.profiler import profile, ProfilerActivity
 import time
@@ -18,7 +17,7 @@ class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
     
-    def forward(self, x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=dtypes.bf16) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
         """
         Args:
             x: [m, k] int8 input
@@ -50,7 +49,7 @@ class Model(nn.Module):
         w_scale = w_scale[:n, :k]
         weight = weight.to(w_scale.dtype) * w_scale
 
-        out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
+        out = F.linear(x.to(torch.float32), weight.to(torch.float32))
         return out.to(dtype)
 
 
@@ -59,7 +58,7 @@ class ModelAiter(nn.Module):
     def __init__(self):
         super(ModelAiter, self).__init__()
     
-    def forward(self, x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=dtypes.bf16) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
         """
         Args:
             x: [m, k] int8 input
@@ -72,30 +71,56 @@ class ModelAiter(nn.Module):
         return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+import subprocess
+
+block_shape = (128, 128)
+
+def get_fp8_dtype():
+    """Auto-detect correct FP8 dtype for current AMD GPU."""
+    try:
+        result = subprocess.run(['rocminfo'], capture_output=True, text=True)
+        output = result.stdout
+        
+        if 'gfx950' in output or 'gfx960' in output:
+            return torch.float8_e4m3fn
+        else:
+            return getattr(torch, 'float8_e4m3fnuz', torch.float8_e4m3fn)
+    except:
+        return getattr(torch, 'float8_e4m3fnuz', torch.float8_e4m3fn)
+
 
 @triton.autotune(
     configs=[
-        # Optimized configs for AMD MFMA (Matrix Fused Multiply-Add) with FP16
-        # Larger blocks for better matrix core utilization
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, 
+                      num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, 
+                      num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, 
+                      num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, 
+                      num_stages=2, num_warps=16),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_M': 8}, 
+                      num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, 
+                      num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 8}, 
+                      num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, 
+                      num_stages=2, num_warps=4),
     ],
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def gemm_a8w8_blockscale_kernel(
+def fused_scaled_matmul_kernel(
     x_ptr, weight_ptr, x_scale_ptr, w_scale_ptr, out_ptr,
     M, N, K,
+    SCALE_BLOCK_N: tl.constexpr,
+    SCALE_BLOCK_K: tl.constexpr,
     stride_xm, stride_xk,
     stride_wn, stride_wk,
     stride_xscale_m, stride_xscale_k,
@@ -105,17 +130,18 @@ def gemm_a8w8_blockscale_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
-    SCALE_BLOCK_K: tl.constexpr,
-    SCALE_BLOCK_N: tl.constexpr,
 ):
     """
-    Fused INT8 GEMM with block-wise scaling.
-    Computes: out = (x * x_scale) @ (weight * w_scale)^T
+    Optimized fused kernel for block-wise scaled fp8 matrix multiplication.
+    Key optimizations:
+    1. Efficient scale loading with precomputed indices
+    2. Minimized scale extraction overhead
+    3. Better memory access patterns
+    4. Reduced arithmetic operations in hot loop
     """
-    # Program ID
     pid = tl.program_id(0)
     
-    # Compute block indices with swizzling for better L2 locality
+    # Block swizzling for better L2 cache locality
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     num_pid_in_group = GROUP_M * num_pid_n
@@ -128,75 +154,68 @@ def gemm_a8w8_blockscale_kernel(
     # Block offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
     
-    # Pointer setup
-    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptrs = weight_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
-    
-    # Accumulator in fp32 for precision
+    # Initialize accumulator in FP32 for numerical stability
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     
-    # Main loop over K dimension
+    # Precompute scale indices for n dimension (constant across K loop)
+    scale_n_idx = offs_n // SCALE_BLOCK_N
+    
+    # Iterate over K dimension
     for k in range(0, K, BLOCK_K):
-        # Boundary checks
-        k_mask = (k + offs_k) < K
-        x_mask = (offs_m[:, None] < M) & k_mask[None, :]
-        w_mask = (offs_n[:, None] < N) & k_mask[None, :]
+        offs_k = k + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
         
-        # Load int8/fp8 values - keep in native format for matrix core
+        # Load input block [BLOCK_M, BLOCK_K]
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        x_mask = (offs_m[:, None] < M) & k_mask[None, :]
         x_fp8 = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        
+        # Load weight block [BLOCK_N, BLOCK_K]
+        w_ptrs = weight_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+        w_mask = (offs_n[:, None] < N) & k_mask[None, :]
         w_fp8 = tl.load(w_ptrs, mask=w_mask, other=0.0)
         
-        # Load scales for this K block
-        # x_scale: [M, scale_k] where scale_k = K / SCALE_BLOCK_K
-        # w_scale: [scale_n, scale_k] where scale_n = N / SCALE_BLOCK_N
-        scale_k_idx = (k + offs_k) // SCALE_BLOCK_K
+        # Compute FP8 matmul with FP32 output
+        result = tl.dot(x_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
         
-        # Load x_scale: [BLOCK_M, BLOCK_K]
-        x_scale_ptrs = x_scale_ptr + (offs_m[:, None] * stride_xscale_m + scale_k_idx[None, :] * stride_xscale_k)
-        x_scale_mask = (offs_m[:, None] < M) & k_mask[None, :]
-        x_scale_fp32 = tl.load(x_scale_ptrs, mask=x_scale_mask, other=1.0)
+        # Compute scale indices for this K block
+        scale_k_idx = k // SCALE_BLOCK_K
         
-        # Load w_scale: [BLOCK_N, BLOCK_K]
-        scale_n_idx = offs_n // SCALE_BLOCK_N
-        w_scale_ptrs = w_scale_ptr + (scale_n_idx[:, None] * stride_wscale_n + scale_k_idx[None, :] * stride_wscale_k)
-        w_scale_mask = (offs_n[:, None] < N) & k_mask[None, :]
-        w_scale_fp32 = tl.load(w_scale_ptrs, mask=w_scale_mask, other=1.0)
+        # Load x_scale values (only need one per M row for this K block)
+        x_scale_ptrs = x_scale_ptr + (offs_m * stride_xscale_m + scale_k_idx * stride_xscale_k)
+        x_scale_mask = offs_m < M
+        x_scale_broadcast = tl.load(x_scale_ptrs, mask=x_scale_mask, other=1.0)
         
-        # Convert scales to fp16 for efficient multiplication with fp8
-        x_scale = x_scale_fp32.to(tl.float16)
-        w_scale = w_scale_fp32.to(tl.float16)
+        # Load w_scale values (only need one per N row for this K block)
+        w_scale_ptrs = w_scale_ptr + (scale_n_idx * stride_wscale_n + scale_k_idx * stride_wscale_k)
+        w_scale_mask = offs_n < N
+        w_scale_broadcast = tl.load(w_scale_ptrs, mask=w_scale_mask, other=1.0)
         
-        # Apply scales in fp16 (more efficient than fp32)
-        # Cast fp8 to fp16 for scaling, keeping high precision
-        x_scaled = x_fp8.to(tl.float16) * x_scale
-        w_scaled = w_fp8.to(tl.float16) * w_scale
+        # Compute outer product of scales [BLOCK_M, 1] × [1, BLOCK_N] = [BLOCK_M, BLOCK_N]
+        scale_factor = x_scale_broadcast[:, None] * w_scale_broadcast[None, :]
         
-        # Use fp16 matrix multiplication with matrix cores (MFMA on AMD)
-        # This utilizes hardware matrix cores for high throughput
-        # Accumulate in fp32 for numerical stability
-        acc += tl.dot(x_scaled, tl.trans(w_scaled), out_dtype=tl.float32)
-        
-        # Advance pointers
-        x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
+        # Apply scaling and accumulate
+        acc += result * scale_factor
     
-    # Convert to output dtype and store
-    out = acc.to(tl.float16)
-    
+    # Store output
     out_ptrs = out_ptr + (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on)
     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    # Convert to output dtype (bfloat16)
+    out = acc.to(tl.bfloat16)
     tl.store(out_ptrs, out, mask=out_mask)
 
 
-def triton_gemm_a8w8_blockscale(x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=dtypes.bf16) -> torch.Tensor:
+def triton_fused_scaled_matmul(x: torch.Tensor, weight: torch.Tensor, 
+                                x_scale: torch.Tensor, w_scale: torch.Tensor,
+                                dtype=torch.bfloat16) -> torch.Tensor:
     """
-    Triton implementation of block-scaled INT8 GEMM.
+    Wrapper function for fused scaled matmul kernel.
     
     Args:
-        x: [M, K] int8 input
-        weight: [N, K] int8 weight
+        x: [M, K] int8/fp8 input
+        weight: [N, K] int8/fp8 weight
         x_scale: [M, scale_k] fp32 activation scales
         w_scale: [scale_n, scale_k] fp32 weight scales
         dtype: output dtype
@@ -204,69 +223,58 @@ def triton_gemm_a8w8_blockscale(x: torch.Tensor, weight: torch.Tensor, x_scale: 
     Returns:
         output: [M, N] in specified dtype
     """
-    assert x.is_cuda and weight.is_cuda
-    # Support multiple fp8 formats
-    fp8_dtypes = [torch.int8, torch.float8_e4m3fn]
-    if hasattr(torch, 'float8_e4m3fnuz'):
-        fp8_dtypes.append(torch.float8_e4m3fnuz)
-    assert x.dtype in fp8_dtypes, f"x.dtype must be one of {fp8_dtypes}, got {x.dtype}"
-    assert weight.dtype in fp8_dtypes, f"weight.dtype must be one of {fp8_dtypes}, got {weight.dtype}"
-    assert x_scale.dtype == torch.float32
-    assert w_scale.dtype == torch.float32
+    assert x.is_cuda and weight.is_cuda, "Tensors must be on CUDA"
     
-    M, K = x.shape
-    N = weight.shape[0]
-    assert weight.shape[1] == K
-    
-    # Ensure contiguous
     x = x.contiguous()
     weight = weight.contiguous()
     x_scale = x_scale.contiguous()
     w_scale = w_scale.contiguous()
     
-    # Allocate output
-    out = torch.empty((M, N), device=x.device, dtype=torch.float16)
+    M, K = x.shape
+    N = weight.shape[0]
     
-    # Grid configuration
-    def grid(META):
-        return (
-            triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
-        )
+    SCALE_BLOCK_N, SCALE_BLOCK_K = block_shape
+    
+    # Allocate output
+    out = torch.empty((M, N), dtype=dtype, device=x.device)
     
     # Launch kernel
-    gemm_a8w8_blockscale_kernel[grid](
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+    )
+    
+    fused_scaled_matmul_kernel[grid](
         x, weight, x_scale, w_scale, out,
         M, N, K,
+        SCALE_BLOCK_N, SCALE_BLOCK_K,
         x.stride(0), x.stride(1),
         weight.stride(0), weight.stride(1),
         x_scale.stride(0), x_scale.stride(1),
         w_scale.stride(0), w_scale.stride(1),
         out.stride(0), out.stride(1),
-        SCALE_BLOCK_K=block_shape[1],
-        SCALE_BLOCK_N=block_shape[0],
     )
     
-    return out.to(dtype)
+    return out
 
 
 class ModelNew(nn.Module):
-    """
-    Optimized implementation using Triton kernel with fused block-wise scaling.
-    """
+    """Optimized implementation using custom Triton kernel."""
     def __init__(self):
         super(ModelNew, self).__init__()
     
-    def forward(self, x: torch.Tensor, weight: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor, dtype=dtypes.bf16) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, weight: torch.Tensor, 
+                x_scale: torch.Tensor, w_scale: torch.Tensor, 
+                dtype=torch.bfloat16) -> torch.Tensor:
         """
         Args:
-            x: [m, k] int8 input
-            weight: [n, k] int8 weight
+            x: [m, k] int8/fp8 input
+            weight: [n, k] int8/fp8 weight
             x_scale: [m, scale_k] fp32 activation scales
             w_scale: [scale_n, scale_k] fp32 weight scales
         Returns:
             output: [m, n] in specified dtype
         """
-        return triton_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+        return triton_fused_scaled_matmul(x, weight, x_scale, w_scale, dtype)
 
 
 # Test configuration
@@ -279,11 +287,11 @@ scale_k = (k + block_shape_k - 1) // block_shape_k
 
 def get_inputs():
     # Support both fp8 formats
-    fp8_dtype = getattr(torch, 'float8_e4m3fnuz', dtypes.fp8)
-    x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(fp8_dtype)
-    weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(fp8_dtype)
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    fp8_dtype = getattr(torch, 'float8_e4m3fnuz', torch.float8_e4m3fn)
+    x = (torch.rand((m, k), dtype=torch.float16, device="cuda") / 10).to(fp8_dtype)
+    weight = (torch.rand((n, k), dtype=torch.float16, device="cuda") / 10).to(fp8_dtype)
+    x_scale = torch.rand([m, scale_k], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
     return [x, weight, x_scale, w_scale]
 
 def get_init_inputs():
@@ -299,9 +307,9 @@ def test_correctness():
     x, weight, x_scale, w_scale = inputs
     
     with torch.no_grad():
-        output_orig = model_orig(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
-        output_aiter = model_aiter(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
-        output_new = model_new(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+        output_orig = model_orig(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
+        output_aiter = model_aiter(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
+        output_new = model_new(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
     
     checkAllclose(output_orig, output_aiter, msg="gemm_a8w8_blockscale (ModelAiter)", rtol=1e-2, atol=0.01)
     checkAllclose(output_orig, output_new, msg="gemm_a8w8_blockscale (ModelNew)", rtol=1e-2, atol=0.01)
@@ -322,7 +330,7 @@ def test_speed():
     # Benchmark Original Model
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_orig(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_orig(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         
     with torch.no_grad():
@@ -334,7 +342,7 @@ def test_speed():
             record_shapes=True,
         ) as prof_orig:
             for _ in range(iterations):
-                _ = model_orig(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+                _ = model_orig(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
             torch.cuda.synchronize()
     
     print("=" * 80)
@@ -345,7 +353,7 @@ def test_speed():
     # Benchmark ModelAiter (AITER)
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_aiter(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_aiter(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         
     with torch.no_grad():
@@ -357,7 +365,7 @@ def test_speed():
             record_shapes=True,
         ) as prof_aiter:
             for _ in range(iterations):
-                _ = model_aiter(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+                _ = model_aiter(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
             torch.cuda.synchronize()
     
     print("\n" + "=" * 80)
@@ -368,7 +376,7 @@ def test_speed():
     # Benchmark ModelNew (Triton)
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_new(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         
     with torch.no_grad():
@@ -380,7 +388,7 @@ def test_speed():
             record_shapes=True,
         ) as prof_new:
             for _ in range(iterations):
-                _ = model_new(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+                _ = model_new(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
             torch.cuda.synchronize()
     
     print("\n" + "=" * 80)
@@ -391,31 +399,31 @@ def test_speed():
     # Simple timing measurements
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_orig(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_orig(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_orig(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_orig(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         orig_time = (time.time() - start) / iterations
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_aiter(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_aiter(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_aiter(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_aiter(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         aiter_time = (time.time() - start) / iterations
     
     with torch.no_grad():
         for _ in range(warmup):
-            _ = model_new(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_new(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(iterations):
-            _ = model_new(x, weight, x_scale, w_scale, dtype=dtypes.bf16)
+            _ = model_new(x, weight, x_scale, w_scale, dtype=torch.bfloat16)
         torch.cuda.synchronize()
         new_time = (time.time() - start) / iterations
     
@@ -424,7 +432,7 @@ def test_speed():
     print("=" * 80)
     print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
     print(f"ModelAiter (AITER) avg time:        {aiter_time*1000:.3f} ms")
-    print(f"ModelNew (Triton) avg time:         {new_time*1000:.3f} ms")
+    print(f"ModelNew (LLM-Triton) avg time:         {new_time*1000:.3f} ms")
     print(f"\nSpeedup AITER vs PyTorch:   {orig_time/aiter_time:.2f}x")
     print(f"Speedup Triton vs PyTorch:  {orig_time/new_time:.2f}x")
     print(f"Speedup Triton vs AITER:    {aiter_time/new_time:.2f}x")

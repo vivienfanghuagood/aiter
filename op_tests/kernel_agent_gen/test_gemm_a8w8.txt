@@ -1,0 +1,78 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] gemm_a8w8_blockscale (ModelAiter)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] gemm_a8w8_blockscale (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+Testing INT8 Block-Scaled GEMM Implementations
+================================================================================
+Test shapes (m, n, k):
+  (1024, 4096, 4096)
+  (2048, 4096, 4096)
+  (4096, 2048, 4096)
+  (8192, 2048, 2048)
+  (16384, 1024, 2048)
+Block shape: (128, 128)
+================================================================================
+
+✓ Correctness test passed for both ModelAiter and ModelNew!
+
+
+================================================================================
+Testing shape: m=1024, n=4096, k=4096
+================================================================================
+Original Model (PyTorch) avg time:  0.624 ms
+ModelAiter (AITER) avg time:        0.243 ms
+ModelNew (Triton) avg time:         0.125 ms
+Speedup AITER vs PyTorch:   2.57x
+Speedup Triton vs PyTorch:  4.98x
+Speedup Triton vs AITER:    1.94x
+
+================================================================================
+Testing shape: m=2048, n=4096, k=4096
+================================================================================
+Original Model (PyTorch) avg time:  1.413 ms
+ModelAiter (AITER) avg time:        0.254 ms
+ModelNew (Triton) avg time:         0.320 ms
+Speedup AITER vs PyTorch:   5.57x
+Speedup Triton vs PyTorch:  4.42x
+Speedup Triton vs AITER:    0.79x
+
+================================================================================
+Testing shape: m=4096, n=2048, k=4096
+================================================================================
+Original Model (PyTorch) avg time:  0.846 ms
+ModelAiter (AITER) avg time:        0.290 ms
+ModelNew (Triton) avg time:         0.280 ms
+Speedup AITER vs PyTorch:   2.92x
+Speedup Triton vs PyTorch:  3.02x
+Speedup Triton vs AITER:    1.03x
+
+================================================================================
+Testing shape: m=8192, n=2048, k=2048
+================================================================================
+Original Model (PyTorch) avg time:  0.961 ms
+ModelAiter (AITER) avg time:        0.295 ms
+ModelNew (Triton) avg time:         0.549 ms
+Speedup AITER vs PyTorch:   3.25x
+Speedup Triton vs PyTorch:  1.75x
+Speedup Triton vs AITER:    0.54x
+
+================================================================================
+Testing shape: m=16384, n=1024, k=2048
+================================================================================
+Original Model (PyTorch) avg time:  1.039 ms
+ModelAiter (AITER) avg time:        0.498 ms
+ModelNew (Triton) avg time:         0.786 ms
+Speedup AITER vs PyTorch:   2.09x
+Speedup Triton vs PyTorch:  1.32x
+Speedup Triton vs AITER:    0.63x
+
+================================================================================
+Geometric Mean Performance Summary:
+================================================================================
+Original Model (PyTorch) geomean time:  0.943 ms
+ModelAiter (AITER) geomean time:        0.305 ms
+ModelNew (Triton) geomean time:         0.344 ms
+
+Speedup AITER vs PyTorch:   3.10x
+Speedup Triton vs PyTorch:  2.74x
+Speedup Triton vs AITER:    0.88x
+================================================================================

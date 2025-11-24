@@ -1,83 +1,77 @@
-merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv
-merge tuned file under model_configs/ and configs/  /app/aiter/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv:/app/aiter/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_dsv3.csv
-[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
-[aiter] import [module_aiter_enum] under /app/aiter/aiter/jit/module_aiter_enum.so
-Testing GELU-and-Mul Implementations
-================================================================================
-Configuration:
-  Batch size:    65536
-  Out features:  8192
-================================================================================
-
-[aiter] import [module_activation] under /app/aiter/aiter/jit/module_activation.so
+[aiter] type hints mismatch, override to --> gelu_and_mul(arg0: torch.Tensor, arg1: torch.Tensor) -> None
 [aiter] gelu_and_mul (ModelAiter)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
 [aiter] gelu_and_mul (ModelNew)[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+Testing GELU-and-Mul Implementations
+================================================================================
+Test shapes (batch_size, out_features):
+  (2048, 4096)
+  (4096, 4096)
+  (8192, 4096)
+  (16384, 2048)
+  (32768, 1024)
+================================================================================
+
 ✓ Correctness test passed for both ModelAiter and ModelNew!
 
-[W1112 12:31:05.124932401 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
-================================================================================
-Original Model (PyTorch):
-================================================================================
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                              aten::mul         0.08%     372.845us         0.21%     980.634us       9.806us     171.721ms        37.09%     171.721ms       1.717ms           0 B           0 B     200.00 GB     200.00 GB           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     171.721ms        37.09%     171.721ms     858.606us           0 B           0 B           0 B           0 B           200  
-                                               aten::to         0.02%     104.581us         0.31%       1.411ms      14.107us       0.000us         0.00%     162.104ms       1.621ms           0 B           0 B     400.00 GB           0 B           100  
-                                         aten::_to_copy         0.06%     258.346us         0.28%       1.306ms      13.061us       0.000us         0.00%     162.104ms       1.621ms           0 B           0 B     400.00 GB           0 B           100  
-                                            aten::copy_         0.07%     321.239us         0.19%     899.831us       8.998us     162.104ms        35.02%     162.104ms       1.621ms           0 B           0 B           0 B           0 B           100  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     162.104ms        35.02%     162.104ms     810.521us           0 B           0 B           0 B           0 B           200  
-                                             aten::gelu         0.09%     392.794us         0.24%       1.089ms      10.886us     129.119ms        27.89%     129.119ms       1.291ms           0 B           0 B     200.00 GB     200.00 GB           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     129.119ms        27.89%     129.119ms     645.597us           0 B           0 B           0 B           0 B           200  
-                                   hipDeviceSynchronize        99.04%     457.065ms        99.04%     457.065ms     228.532ms       3.180ms         0.69%       3.180ms       1.590ms           0 B           0 B           0 B           0 B             2  
-                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -800.00 GB    -800.00 GB           300  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 461.511ms
-Self CUDA time total: 462.945ms
-
 
 ================================================================================
-ModelAiter (AITER gelu_and_mul):
+Testing shape: batch=2048, out_features=4096
 ================================================================================
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                    aiter::gelu_and_mul         0.49%     640.805us         0.75%     969.640us       9.696us     130.641ms       100.00%     130.641ms       1.306ms           0 B           0 B           0 B           0 B           100  
-_ZN5aiter18act_and_mul_kernelIDF16_TnPFfRKT_EXadL_ZN...         0.00%       0.000us         0.00%       0.000us       0.000us     130.641ms       100.00%     130.641ms       1.306ms           0 B           0 B           0 B           0 B           100  
-                                               [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -100.00 GB    -100.00 GB           100  
-                                            aten::empty         0.14%     182.976us         0.14%     182.976us       1.830us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     100.00 GB     100.00 GB           100  
-                                        hipLaunchKernel         0.25%     328.835us         0.25%     328.835us       3.288us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
-                                   hipDeviceSynchronize        99.11%     128.608ms        99.11%     128.608ms      64.304ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 129.761ms
-Self CUDA time total: 130.641ms
-
+Original Model (PyTorch) avg time:  0.047 ms
+ModelAiter (AITER) avg time:        0.015 ms
+ModelNew (Triton) avg time:         0.031 ms
+Speedup AITER vs PyTorch:   3.08x
+Speedup Triton vs PyTorch:  1.52x
+Speedup Triton vs AITER:    0.49x
 
 ================================================================================
-ModelNew (Triton Fused):
+Testing shape: batch=4096, out_features=4096
 ================================================================================
---------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                      Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
---------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-       gelu_and_mul_kernel         0.00%       0.000us         0.00%       0.000us       0.000us      98.640ms       100.00%      98.640ms     986.400us           0 B           0 B           0 B           0 B           100  
-                  [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 B           0 B    -100.00 GB    -100.00 GB           100  
-               aten::empty         0.21%     188.948us         0.21%     188.948us       1.889us       0.000us         0.00%       0.000us       0.000us           0 B           0 B     100.00 GB     100.00 GB           100  
-    hipPointerGetAttribute         0.03%      30.897us         0.03%      30.897us       0.154us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           200  
-     hipModuleLaunchKernel         0.36%     319.740us         0.36%     319.740us       3.197us       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B           100  
-      hipDeviceSynchronize        99.39%      88.370ms        99.39%      88.370ms      44.185ms       0.000us         0.00%       0.000us       0.000us           0 B           0 B           0 B           0 B             2  
---------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 88.910ms
-Self CUDA time total: 98.640ms
-
+Original Model (PyTorch) avg time:  0.092 ms
+ModelAiter (AITER) avg time:        0.029 ms
+ModelNew (Triton) avg time:         0.031 ms
+Speedup AITER vs PyTorch:   3.21x
+Speedup Triton vs PyTorch:  2.91x
+Speedup Triton vs AITER:    0.91x
 
 ================================================================================
-Performance Summary:
+Testing shape: batch=8192, out_features=4096
 ================================================================================
-Original Model (PyTorch) avg time:  3.050 ms
-ModelAiter (AITER) avg time:          1.315 ms
-ModelNew (Triton) avg time:       0.988 ms
+Original Model (PyTorch) avg time:  0.193 ms
+ModelAiter (AITER) avg time:        0.183 ms
+ModelNew (Triton) avg time:         0.123 ms
+Speedup AITER vs PyTorch:   1.05x
+Speedup Triton vs PyTorch:  1.57x
+Speedup Triton vs AITER:    1.49x
 
-Speedup AITER vs PyTorch:   2.32x
-Speedup Triton vs PyTorch:  3.09x
-Speedup Triton vs AITER:    1.33x
+================================================================================
+Testing shape: batch=16384, out_features=2048
+================================================================================
+Original Model (PyTorch) avg time:  0.218 ms
+ModelAiter (AITER) avg time:        0.151 ms
+ModelNew (Triton) avg time:         0.056 ms
+Speedup AITER vs PyTorch:   1.45x
+Speedup Triton vs PyTorch:  3.93x
+Speedup Triton vs AITER:    2.72x
+
+================================================================================
+Testing shape: batch=32768, out_features=1024
+================================================================================
+Original Model (PyTorch) avg time:  0.183 ms
+ModelAiter (AITER) avg time:        0.204 ms
+ModelNew (Triton) avg time:         0.055 ms
+Speedup AITER vs PyTorch:   0.90x
+Speedup Triton vs PyTorch:  3.31x
+Speedup Triton vs AITER:    3.69x
+
+================================================================================
+Geometric Mean Performance Summary:
+================================================================================
+Original Model (PyTorch) geomean time:  0.127 ms
+ModelAiter (AITER) geomean time:        0.076 ms
+ModelNew (Triton) geomean time:         0.052 ms
+
+Speedup AITER vs PyTorch:   1.68x
+Speedup Triton vs PyTorch:  2.46x
+Speedup Triton vs AITER:    1.46x
 ================================================================================

@@ -159,28 +159,35 @@ class ModelNew(nn.Module):
         # x: [batch_size, 2 * out_features]
         return triton_fused_gelu_mul(x, self.out_features)
 
-# Test configuration
-batch_size = 64 * 1024
-out_features = 8192
+# Test configurations: (batch_size, out_features)
+# Using larger shapes for better Triton performance
+test_shapes = [
+    (2048, 4096),
+    (4096, 4096),
+    (8192, 4096),
+    (16384, 2048),
+    (32768, 1024),
+]
 
 
-def get_inputs():
+def get_inputs(batch_size, out_features):
     """Generate input tensor of shape [batch_size, 2 * out_features]"""
     return [torch.rand(batch_size, 2 * out_features, dtype=dtypes.fp16, device="cuda")]
 
 
-def get_init_inputs():
+def get_init_inputs(out_features):
     return [out_features]
 
 
 def test_correctness():
     """Test that all three implementations produce the same results."""
-    init_inputs = get_init_inputs()
+    batch_size, out_features = test_shapes[0]
+    init_inputs = get_init_inputs(out_features)
     model_orig = Model(*init_inputs).cuda()
     model_aiter = ModelAiter(*init_inputs).cuda()
     model_new = ModelNew(*init_inputs).cuda()
     
-    inputs = get_inputs()
+    inputs = get_inputs(batch_size, out_features)
     x = inputs[0]
     
     with torch.no_grad():
@@ -195,137 +202,95 @@ def test_correctness():
 
 
 def test_speed():
-    """Benchmark the performance of all three implementations."""
-    init_inputs = get_init_inputs()
-    model_orig = Model(*init_inputs).cuda()
-    model_aiter = ModelAiter(*init_inputs).cuda()
-    model_new = ModelNew(*init_inputs).cuda()
-    
-    inputs = get_inputs()
-    x = inputs[0]
+    """Benchmark the performance of all three implementations across multiple shapes."""
+    import numpy as np
     
     warmup = 10
     iterations = 100
     
-    # Benchmark Original Model
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_orig(x.to(dtypes.fp32))
-        torch.cuda.synchronize()
+    orig_times = []
+    aiter_times = []
+    new_times = []
+    
+    for batch_size, out_features in test_shapes:
+        print(f"\n{'='*80}")
+        print(f"Testing shape: batch={batch_size}, out_features={out_features}")
+        print(f"{'='*80}")
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_orig:
-            for _ in range(iterations):
-                _ = model_orig(x.to(dtypes.fp32))
+        init_inputs = get_init_inputs(out_features)
+        model_orig = Model(*init_inputs).cuda()
+        model_aiter = ModelAiter(*init_inputs).cuda()
+        model_new = ModelNew(*init_inputs).cuda()
+        
+        inputs = get_inputs(batch_size, out_features)
+        x = inputs[0]
+        
+        # Simple timing measurements
+        x_fp32 = x.to(dtypes.fp32)
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_orig(x_fp32)
             torch.cuda.synchronize()
-    
-    print("=" * 80)
-    print("Original Model (PyTorch):")
-    print("=" * 80)
-    print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Benchmark ModelAiter (AITER)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_aiter(x)
-        torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(iterations):
+                _ = model_orig(x_fp32)
+            torch.cuda.synchronize()
+            orig_time = (time.time() - start) / iterations
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_new:
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_aiter(x)
+            torch.cuda.synchronize()
+            start = time.time()
             for _ in range(iterations):
                 _ = model_aiter(x)
             torch.cuda.synchronize()
-    
-    print("\n" + "=" * 80)
-    print("ModelAiter (AITER gelu_and_mul):")
-    print("=" * 80)
-    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Benchmark ModelNew (Triton)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_new(x)
-        torch.cuda.synchronize()
+            aiter_time = (time.time() - start) / iterations
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_agent:
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_new(x)
+            torch.cuda.synchronize()
+            start = time.time()
             for _ in range(iterations):
                 _ = model_new(x)
             torch.cuda.synchronize()
+            new_time = (time.time() - start) / iterations
+        
+        orig_times.append(orig_time)
+        aiter_times.append(aiter_time)
+        new_times.append(new_time)
+        
+        print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
+        print(f"ModelAiter (AITER) avg time:        {aiter_time*1000:.3f} ms")
+        print(f"ModelNew (Triton) avg time:         {new_time*1000:.3f} ms")
+        print(f"Speedup AITER vs PyTorch:   {orig_time/aiter_time:.2f}x")
+        print(f"Speedup Triton vs PyTorch:  {orig_time/new_time:.2f}x")
+        print(f"Speedup Triton vs AITER:    {aiter_time/new_time:.2f}x")
+    
+    # Calculate geometric mean
+    orig_geomean = np.exp(np.mean(np.log(orig_times)))
+    aiter_geomean = np.exp(np.mean(np.log(aiter_times)))
+    new_geomean = np.exp(np.mean(np.log(new_times)))
     
     print("\n" + "=" * 80)
-    print("ModelNew (Triton Fused):")
+    print("Geometric Mean Performance Summary:")
     print("=" * 80)
-    print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Simple timing measurements
-    x_fp32 = x.to(dtypes.fp32)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_orig(x_fp32)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_orig(x_fp32)
-        torch.cuda.synchronize()
-        orig_time = (time.time() - start) / iterations
-    
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_aiter(x)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_aiter(x)
-        torch.cuda.synchronize()
-        new_time = (time.time() - start) / iterations
-    
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_new(x)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_new(x)
-        torch.cuda.synchronize()
-        agent_time = (time.time() - start) / iterations
-    
-    print("\n" + "=" * 80)
-    print("Performance Summary:")
-    print("=" * 80)
-    print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
-    print(f"ModelAiter (AITER) avg time:          {new_time*1000:.3f} ms")
-    print(f"ModelNew (Triton) avg time:       {agent_time*1000:.3f} ms")
-    print(f"\nSpeedup AITER vs PyTorch:   {orig_time/new_time:.2f}x")
-    print(f"Speedup Triton vs PyTorch:  {orig_time/agent_time:.2f}x")
-    print(f"Speedup Triton vs AITER:    {new_time/agent_time:.2f}x")
+    print(f"Original Model (PyTorch) geomean time:  {orig_geomean*1000:.3f} ms")
+    print(f"ModelAiter (AITER) geomean time:        {aiter_geomean*1000:.3f} ms")
+    print(f"ModelNew (Triton) geomean time:         {new_geomean*1000:.3f} ms")
+    print(f"\nSpeedup AITER vs PyTorch:   {orig_geomean/aiter_geomean:.2f}x")
+    print(f"Speedup Triton vs PyTorch:  {orig_geomean/new_geomean:.2f}x")
+    print(f"Speedup Triton vs AITER:    {aiter_geomean/new_geomean:.2f}x")
     print("=" * 80)
 
 
 if __name__ == "__main__":
     print("Testing GELU-and-Mul Implementations")
     print("=" * 80)
-    print(f"Configuration:")
-    print(f"  Batch size:    {batch_size}")
-    print(f"  Out features:  {out_features}")
+    print(f"Test shapes (batch_size, out_features):")
+    for shape in test_shapes:
+        print(f"  {shape}")
     print("=" * 80)
     print()
     

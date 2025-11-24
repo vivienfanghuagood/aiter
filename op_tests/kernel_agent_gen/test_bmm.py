@@ -176,12 +176,16 @@ class ModelNew(nn.Module):
         """
         return triton_batched_matmul(A, B)
 
-batch_size = 128
-m = 128 * 4
-k = 256 * 4
-n = 512 * 4
+# Test configurations: (batch_size, m, k, n)
+test_shapes = [
+    (16, 256, 512, 512),
+    (32, 512, 512, 1024),
+    (64, 512, 1024, 512),
+    (128, 512, 1024, 2048),
+    (256, 256, 512, 1024),
+]
 
-def get_inputs():
+def get_inputs(batch_size, m, k, n):
     A = torch.rand(batch_size, m, k, dtype=dtypes.bf16, device="cuda")
     B = torch.rand(batch_size, k, n, dtype=dtypes.bf16, device="cuda")
     return [A, B]
@@ -195,7 +199,8 @@ def test_correctness():
     model_aiter = ModelAiter().cuda()
     model_new = ModelNew().cuda()
     
-    inputs = get_inputs()
+    batch_size, m, k, n = test_shapes[0]
+    inputs = get_inputs(batch_size, m, k, n)
     A, B = inputs
     
     with torch.no_grad():
@@ -208,136 +213,92 @@ def test_correctness():
     print("✓ Correctness test passed for both ModelAiter and ModelNew!")
 
 def test_speed():
-    """Benchmark the performance of all three implementations."""
+    """Benchmark the performance of all three implementations across multiple shapes."""
+    import numpy as np
+    
     model_orig = Model().cuda()
     model_aiter = ModelAiter().cuda()
     model_new = ModelNew().cuda()
     
-    inputs = get_inputs()
-    A, B = inputs
-    
     warmup = 10
     iterations = 100
     
-    # Benchmark Original Model
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_orig(A, B)
-        torch.cuda.synchronize()
+    orig_times = []
+    aiter_times = []
+    new_times = []
+    
+    for batch_size, m, k, n in test_shapes:
+        print(f"\n{'='*80}")
+        print(f"Testing shape: batch={batch_size}, m={m}, k={k}, n={n}")
+        print(f"{'='*80}")
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_orig:
+        inputs = get_inputs(batch_size, m, k, n)
+        A, B = inputs
+    
+        # Simple timing measurements
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_orig(A, B)
+            torch.cuda.synchronize()
+            start = time.time()
             for _ in range(iterations):
                 _ = model_orig(A, B)
             torch.cuda.synchronize()
-    
-    print("=" * 80)
-    print("Original Model (PyTorch):")
-    print("=" * 80)
-    print(prof_orig.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Benchmark ModelAiter (AITER)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_aiter(A, B)
-        torch.cuda.synchronize()
+            orig_time = (time.time() - start) / iterations
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_new:
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_aiter(A, B)
+            torch.cuda.synchronize()
+            start = time.time()
             for _ in range(iterations):
                 _ = model_aiter(A, B)
             torch.cuda.synchronize()
-    
-    print("\n" + "=" * 80)
-    print("ModelAiter (AITER batched_gemm_bf16_CK):")
-    print("=" * 80)
-    print(prof_new.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Benchmark ModelNew (Triton)
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_new(A, B)
-        torch.cuda.synchronize()
+            aiter_time = (time.time() - start) / iterations
         
-    with torch.no_grad():
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            profile_memory=True,
-            with_stack=True,
-            with_modules=True,
-            record_shapes=True,
-        ) as prof_agent:
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model_new(A, B)
+            torch.cuda.synchronize()
+            start = time.time()
             for _ in range(iterations):
                 _ = model_new(A, B)
             torch.cuda.synchronize()
+            new_time = (time.time() - start) / iterations
+        
+        orig_times.append(orig_time)
+        aiter_times.append(aiter_time)
+        new_times.append(new_time)
+        
+        print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
+        print(f"ModelAiter (AITER) avg time:        {aiter_time*1000:.3f} ms")
+        print(f"ModelNew (Triton) avg time:         {new_time*1000:.3f} ms")
+        print(f"Speedup AITER vs PyTorch:   {orig_time/aiter_time:.2f}x")
+        print(f"Speedup Triton vs PyTorch:  {orig_time/new_time:.2f}x")
+        print(f"Speedup Triton vs AITER:    {aiter_time/new_time:.2f}x")
+    
+    # Calculate geometric mean
+    orig_geomean = np.exp(np.mean(np.log(orig_times)))
+    aiter_geomean = np.exp(np.mean(np.log(aiter_times)))
+    new_geomean = np.exp(np.mean(np.log(new_times)))
     
     print("\n" + "=" * 80)
-    print("ModelNew (Triton Fused):")
+    print("Geometric Mean Performance Summary:")
     print("=" * 80)
-    print(prof_agent.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-    
-    # Simple timing measurements
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_orig(A, B)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_orig(A, B)
-        torch.cuda.synchronize()
-        orig_time = (time.time() - start) / iterations
-    
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_aiter(A, B)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_aiter(A, B)
-        torch.cuda.synchronize()
-        new_time = (time.time() - start) / iterations
-    
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model_new(A, B)
-        torch.cuda.synchronize()
-        start = time.time()
-        for _ in range(iterations):
-            _ = model_new(A, B)
-        torch.cuda.synchronize()
-        agent_time = (time.time() - start) / iterations
-    
-    print("\n" + "=" * 80)
-    print("Performance Summary:")
-    print("=" * 80)
-    print(f"Original Model (PyTorch) avg time:  {orig_time*1000:.3f} ms")
-    print(f"ModelAiter (AITER) avg time:          {new_time*1000:.3f} ms")
-    print(f"ModelNew (Triton) avg time:       {agent_time*1000:.3f} ms")
-    print(f"\nSpeedup AITER vs PyTorch:   {orig_time/new_time:.2f}x")
-    print(f"Speedup Triton vs PyTorch:  {orig_time/agent_time:.2f}x")
-    print(f"Speedup Triton vs AITER:    {new_time/agent_time:.2f}x")
+    print(f"Original Model (PyTorch) geomean time:  {orig_geomean*1000:.3f} ms")
+    print(f"ModelAiter (AITER) geomean time:        {aiter_geomean*1000:.3f} ms")
+    print(f"ModelNew (Triton) geomean time:         {new_geomean*1000:.3f} ms")
+    print(f"\nSpeedup AITER vs PyTorch:   {orig_geomean/aiter_geomean:.2f}x")
+    print(f"Speedup Triton vs PyTorch:  {orig_geomean/new_geomean:.2f}x")
+    print(f"Speedup Triton vs AITER:    {aiter_geomean/new_geomean:.2f}x")
     print("=" * 80)
 
 if __name__ == "__main__":
     print("Testing Batched Matrix Multiplication Implementations")
     print("=" * 80)
-    print(f"Configuration:")
-    print(f"  Batch size:    {batch_size}")
-    print(f"  M:             {m}")
-    print(f"  K:             {k}")
-    print(f"  N:             {n}")
+    print(f"Test shapes (batch, m, k, n):")
+    for shape in test_shapes:
+        print(f"  {shape}")
     print("=" * 80)
     print()
     

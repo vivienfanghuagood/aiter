@@ -38,6 +38,7 @@ docs/
 ├── index.rst            # Homepage
 ├── installation.rst     # Installation guide
 ├── quickstart.rst       # Quick start tutorial
+├── rdna4_moe_optimization_log.md  # RDNA4 MoE bring-up and tuning log
 ├── api/                 # API reference
 │   ├── attention.rst    # Attention operations
 │   ├── gemm.rst         # GEMM operations
@@ -213,6 +214,7 @@ We use `sphinx_rtd_theme` (Read the Docs theme) with AMD branding:
 
 ## Resources
 
+- [RDNA4 MoE optimization log](rdna4_moe_optimization_log.md)
 - [Sphinx Documentation](https://www.sphinx-doc.org/)
 - [reStructuredText Primer](https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html)
 - [Read the Docs Theme](https://sphinx-rtd-theme.readthedocs.io/)

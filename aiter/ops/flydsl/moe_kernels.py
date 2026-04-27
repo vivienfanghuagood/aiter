@@ -14,6 +14,69 @@ import torch
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
 _SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+_RDNA4_STD_DTYPES = frozenset({"fp16", "bf16"})
+
+
+def _norm_dtype(dtype) -> str:
+    if dtype in (torch.float16, dtypes.fp16):
+        return "fp16"
+    if dtype in (torch.bfloat16, dtypes.bf16):
+        return "bf16"
+    if dtype in (torch.float32, dtypes.fp32):
+        return "f32"
+    return str(dtype).strip().lower()
+
+
+@functools.lru_cache(maxsize=1)
+def _get_runtime_gfx() -> str:
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+
+        return str(get_rocm_arch() or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _is_rdna4_std_moe_dtype_pair(a_dtype: str, b_dtype: str, out_dtype: str) -> bool:
+    a_s = _norm_dtype(a_dtype)
+    b_s = _norm_dtype(b_dtype)
+    out_s = _norm_dtype(out_dtype)
+    return (
+        a_s == b_s
+        and a_s in _RDNA4_STD_DTYPES
+        and out_s in {"f16", "bf16", "fp16", "bfloat16", "half"}
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _load_rdna4_std_moe_api():
+    """Return the vendored RDNA4 standard MoE builder module when available."""
+
+    try:
+        from .kernels import rdna_moe_gemm_2stage
+
+        return rdna_moe_gemm_2stage
+    except Exception:
+        return None
+
+
+def _should_use_rdna4_std_moe(a_dtype: str, b_dtype: str, out_dtype: str) -> bool:
+    return (
+        _get_runtime_gfx().startswith("gfx120")
+        and _is_rdna4_std_moe_dtype_pair(a_dtype, b_dtype, out_dtype)
+    )
+
+
+def rdna4_standard_moe_available(dtype) -> bool:
+    """Return whether the vendored RDNA4 fp16/bf16 MoE builder is importable."""
+
+    dtype_s = _norm_dtype(dtype)
+    gfx = _get_runtime_gfx()
+    return (
+        gfx.startswith("gfx120")
+        and dtype_s in _RDNA4_STD_DTYPES
+        and _load_rdna4_std_moe_api() is not None
+    )
 
 
 def flydsl_kernel_name(
@@ -247,9 +310,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
         )
     else:
-        from .kernels.moe_gemm_2stage import compile_moe_gemm1
-
-        return compile_moe_gemm1(
+        kwargs = dict(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -261,6 +322,16 @@ def compile_flydsl_moe_stage1(
             in_dtype=a_dtype,
             out_dtype=out_dtype,
         )
+        if _should_use_rdna4_std_moe(a_dtype, b_dtype, out_dtype):
+            rdna_mod = _load_rdna4_std_moe_api()
+            if rdna_mod is not None:
+                kwargs["waves_per_eu"] = waves_per_eu
+                return rdna_mod.compile_moe_gemm1(**kwargs)
+
+        if True:
+            from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        return compile_moe_gemm1(**kwargs)
 
 
 def compile_flydsl_moe_stage2(
@@ -310,9 +381,7 @@ def compile_flydsl_moe_stage2(
             enable_bias=enable_bias,
         )
     else:
-        from .kernels.moe_gemm_2stage import compile_moe_gemm2
-
-        return compile_moe_gemm2(
+        kwargs = dict(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -325,6 +394,15 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
         )
+        if _should_use_rdna4_std_moe(a_dtype, b_dtype, out_dtype):
+            rdna_mod = _load_rdna4_std_moe_api()
+            if rdna_mod is not None:
+                return rdna_mod.compile_moe_gemm2(**kwargs)
+
+        if True:
+            from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(**kwargs)
 
 
 # Private helpers
@@ -859,6 +937,8 @@ def flydsl_moe_stage2(
         out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
+    elif accumulate:
+        out.zero_()
 
     dev = inter_states.device
     flat_a_scale = (
@@ -895,6 +975,8 @@ def flydsl_moe_stage2(
 
     target = out
     if not accumulate:
+        # The reduce kernel writes the full token/topk/model buffer, so
+        # zero-initializing this temporary only adds launch overhead.
         target = torch.empty(
             (token_num * topk * model_dim,),
             device=out.device,

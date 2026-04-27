@@ -3,6 +3,7 @@
 
 import functools
 import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -22,6 +23,348 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_FUSED_MOE_MODULE_NAME = "aiter.fused_moe"
+_GFX120X_ARCHES = frozenset({"gfx1200", "gfx1201"})
+_RDNA4_MOE_SORTING_SAFE_BLOCK_SIZES = frozenset({16, 32, 64, 128})
+_RDNA4_NATIVE_SORTING_FALLBACK_WARNED = False
+
+
+def _allocate_moe_sorting_outputs(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+):
+    device = topk_ids.device
+    topk_ids = topk_ids.to(dtype=dtypes.i32)
+    topk_weights = topk_weights.to(dtype=dtypes.fp32)
+    token_num, topk = topk_ids.shape
+    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    sentinel = (topk << 24) | token_num
+
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), sentinel, dtype=dtypes.i32, device=device
+    )
+    sorted_weights = torch.zeros(
+        (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.full(
+        (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
+    )
+    num_valid_ids = torch.zeros(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.zeros((token_num, model_dim), dtype=moebuf_dtype, device=device)
+    return (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        token_num,
+        topk,
+        sentinel,
+    )
+
+
+def _rdna4_moe_sorting_backend_mode() -> str:
+    mode = os.environ.get("AITER_RDNA4_MOE_SORTING_BACKEND", "auto")
+    mode = str(mode).strip().lower()
+    return mode if mode in {"auto", "native", "fallback"} else "auto"
+
+
+def _rdna4_native_sorting_structurally_supported(
+    *,
+    expert_mask,
+    num_local_tokens,
+    dispatch_policy,
+    use_opus,
+) -> bool:
+    return (
+        expert_mask is None
+        and num_local_tokens is None
+        and int(dispatch_policy) == 0
+        and not bool(use_opus)
+    )
+
+
+def _rdna4_native_sorting_safe_shape(
+    *,
+    token_num,
+    num_experts,
+    topk,
+    block_size,
+    moebuf_dtype,
+) -> bool:
+    return (
+        moebuf_dtype == dtypes.fp16
+        and int(token_num) <= 16
+        and int(num_experts) <= 128
+        and int(topk) <= 4
+        and int(block_size) in _RDNA4_MOE_SORTING_SAFE_BLOCK_SIZES
+    )
+
+
+def _rdna4_pick_moe_sorting_backend(
+    *,
+    token_num,
+    num_experts,
+    topk,
+    block_size,
+    moebuf_dtype,
+    expert_mask,
+    num_local_tokens,
+    dispatch_policy,
+    use_opus,
+    mode: Optional[str] = None,
+) -> str:
+    mode = _rdna4_moe_sorting_backend_mode() if mode is None else str(mode)
+    if mode == "fallback":
+        return "fallback"
+    if not _rdna4_native_sorting_structurally_supported(
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        dispatch_policy=dispatch_policy,
+        use_opus=use_opus,
+    ):
+        return "fallback"
+    if mode == "native":
+        return "native"
+    return (
+        "native"
+        if _rdna4_native_sorting_safe_shape(
+            token_num=token_num,
+            num_experts=num_experts,
+            topk=topk,
+            block_size=block_size,
+            moebuf_dtype=moebuf_dtype,
+        )
+        else "fallback"
+    )
+
+
+def _moe_sorting_torch_fallback(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+):
+    (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        _token_num,
+        _topk,
+        _sentinel,
+    ) = _allocate_moe_sorting_outputs(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+    )
+
+    work_topk_ids = topk_ids
+    work_topk_weights = topk_weights
+    if num_local_tokens is not None:
+        local_M = int(num_local_tokens.item())
+        work_topk_ids = work_topk_ids[:local_M]
+        work_topk_weights = work_topk_weights[:local_M]
+
+    sorted_ids_begin = 0
+    sorted_expert_ids_begin = 0
+    skipped_experts = 0
+    for expert_id in range(num_experts):
+        if expert_mask is not None and expert_mask[expert_id] == 0:
+            skipped_experts += 1
+            continue
+        token_id, topk_id = torch.where(work_topk_ids == expert_id)
+        token_count = token_id.numel()
+        expert_block_count = (token_count + block_size - 1) // block_size
+        tokens_padded = expert_block_count * block_size
+        sorted_ids[sorted_ids_begin : sorted_ids_begin + token_count] = (
+            topk_id << 24
+        ) | token_id
+        sorted_weights[sorted_ids_begin : sorted_ids_begin + token_count] = (
+            work_topk_weights[token_id, topk_id]
+        )
+        sorted_expert_ids[
+            sorted_expert_ids_begin : sorted_expert_ids_begin + expert_block_count
+        ] = (expert_id - skipped_experts)
+        sorted_ids_begin += tokens_padded
+        sorted_expert_ids_begin += expert_block_count
+
+    num_valid_ids[0] = sorted_ids_begin
+    num_valid_ids[1] = work_topk_ids.shape[0]
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+
+def _moe_sorting_rdna4_fallback(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    expert_mask,
+    num_local_tokens,
+):
+    if expert_mask is not None:
+        return _moe_sorting_torch_fallback(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+        )
+
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+
+    (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        token_num,
+        topk,
+        sentinel,
+    ) = _allocate_moe_sorting_outputs(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+    )
+
+    work_topk_ids = topk_ids
+    work_topk_weights = topk_weights
+    local_M = token_num
+    if num_local_tokens is not None:
+        local_M = int(num_local_tokens.item())
+        work_topk_ids = work_topk_ids[:local_M]
+        work_topk_weights = work_topk_weights[:local_M]
+
+    if work_topk_ids.numel() == 0:
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+    triton_sorted_ids = torch.full(
+        (sorted_ids.shape[0],),
+        work_topk_ids.numel(),
+        dtype=dtypes.i32,
+        device=topk_ids.device,
+    )
+    moe_align_block_size_triton(
+        work_topk_ids,
+        num_experts,
+        block_size,
+        triton_sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids[:1],
+    )
+
+    # Keep the RDNA4 path graph-capture friendly by avoiding host-side
+    # reads from num_valid_ids. moe_align_block_size_triton pre-fills unused
+    # entries in triton_sorted_ids with work_topk_ids.numel(), so the full
+    # tensor can be packed with device-side masks only.
+    valid_flat_ids = triton_sorted_ids
+    pad_mask = valid_flat_ids == work_topk_ids.numel()
+    token_ids = torch.div(valid_flat_ids, topk, rounding_mode="floor")
+    topk_slot_ids = valid_flat_ids - token_ids * topk
+    packed_ids = (topk_slot_ids << 24) | token_ids
+    sorted_ids.copy_(
+        torch.where(
+            pad_mask,
+            torch.full_like(packed_ids, sentinel),
+            packed_ids,
+        )
+    )
+
+    flat_weights = work_topk_weights.reshape(-1)
+    gather_ids = torch.where(
+        pad_mask,
+        torch.zeros_like(valid_flat_ids),
+        valid_flat_ids,
+    )
+    sorted_weights.copy_(
+        torch.where(
+            pad_mask,
+            torch.zeros_like(valid_flat_ids, dtype=dtypes.fp32),
+            flat_weights[gather_ids],
+        )
+    )
+    num_valid_ids[1].fill_(local_M)
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+
+def _moe_sorting_rdna4_native(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    dispatch_policy,
+    use_opus,
+):
+    (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        token_num,
+        _topk,
+        _sentinel,
+    ) = _allocate_moe_sorting_outputs(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        model_dim,
+        moebuf_dtype,
+        block_size,
+    )
+
+    # RDNA4 stage1/stage2 scan the full padded sort buffers, so the native
+    # sorter must consume pre-filled sentinel/zero/-1 outputs instead of
+    # uninitialized storage.
+    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
+    fwd_fn(
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        num_experts,
+        int(block_size),
+        None,
+        None,
+        dispatch_policy,
+    )
+    num_valid_ids[1].fill_(token_num)
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
 def _moe_sorting_impl(
@@ -36,7 +379,56 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
 ):
+    if get_gfx() in _GFX120X_ARCHES:
+        backend_mode = _rdna4_moe_sorting_backend_mode()
+        backend = _rdna4_pick_moe_sorting_backend(
+            token_num=topk_ids.shape[0],
+            num_experts=num_experts,
+            topk=topk_ids.shape[1],
+            block_size=block_size,
+            moebuf_dtype=moebuf_dtype,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
+            dispatch_policy=dispatch_policy,
+            use_opus=use_opus,
+            mode=backend_mode,
+        )
+        if backend == "native":
+            try:
+                return _moe_sorting_rdna4_native(
+                    topk_ids,
+                    topk_weights,
+                    num_experts,
+                    model_dim,
+                    moebuf_dtype,
+                    block_size,
+                    dispatch_policy,
+                    use_opus,
+                )
+            except Exception as exc:
+                if backend_mode != "auto":
+                    raise
+                global _RDNA4_NATIVE_SORTING_FALLBACK_WARNED
+                if not _RDNA4_NATIVE_SORTING_FALLBACK_WARNED:
+                    logger.warning(
+                        "RDNA4 native moe_sorting failed once; falling back to the"
+                        f" graph-safe Triton path. Error: {exc}"
+                    )
+                    _RDNA4_NATIVE_SORTING_FALLBACK_WARNED = True
+        return _moe_sorting_rdna4_fallback(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            expert_mask,
+            num_local_tokens,
+        )
+
     device = topk_ids.device
+    topk_ids = topk_ids.to(dtype=dtypes.i32)
+    topk_weights = topk_weights.to(dtype=dtypes.fp32)
     M, topk = topk_ids.shape
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
@@ -47,7 +439,7 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
@@ -125,17 +517,14 @@ def fused_moe(
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
-    # following for quant
-    w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
-    # following for tuning
+    w1_scale: Optional[torch.tensor] = None,
+    w2_scale: Optional[torch.tensor] = None,
+    a1_scale: Optional[torch.tensor] = None,
+    a2_scale: Optional[torch.tensor] = None,
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
-    # following for cktile support
     hidden_pad=0,
     intermediate_pad=0,
     bias1=None,
@@ -144,28 +533,28 @@ def fused_moe(
 ):
     if not block_size_M:
         block_size_M = -1
-    return fused_moe_(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        expert_mask=expert_mask,
-        activation=activation.value,
-        quant_type=quant_type.value,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_size_M=block_size_M,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        dtype=dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
+    return sys.modules[_FUSED_MOE_MODULE_NAME].fused_moe_(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        activation.value,
+        quant_type.value,
+        doweight_stage1,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_size_M,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+        dtype,
+        hidden_pad,
+        intermediate_pad,
+        bias1,
+        bias2,
     )
 
 
@@ -202,8 +591,7 @@ def fused_moe_fake(
     return moe_buf
 
 
-@torch_compile_guard(gen_fake=fused_moe_fake)
-def fused_moe_(
+def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
     w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
@@ -273,8 +661,37 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    padded_M = get_padded_M(M)
+    if _rdna4_should_use_triton_e2e(
+        token=padded_M,
+        model_dim=model_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=quant_type,
+        use_g1u1=isG1U1,
+        activation=activation,
+        is_shuffled=isShuffled,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+    ):
+        logger.info(
+            "[fused_moe] using RDNA4 Triton E2E fallback on %s for token=%s, model_dim=%s",
+            get_gfx(),
+            padded_M,
+            model_dim,
+        )
+        return _rdna4_triton_e2e_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            dtype=dtype,
+        )
+
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        padded_M,  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -306,6 +723,14 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
+    moe_out = moe_buf
+    if (
+        not metadata.run_1stage
+        and getattr(metadata.stage1, "func", None) is _rdna4_flydsl_stage1_wrapper
+    ):
+        # RDNA4 FlyDSL stage2 is numerically stable when its final output buffer
+        # is disjoint from the scratch tensor returned by moe_sorting.
+        moe_out = torch.empty_like(moe_buf)
 
     if metadata.run_1stage:
         return metadata.stage1(
@@ -317,7 +742,7 @@ def fused_moe_(
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
-            moe_buf,
+            moe_out,
             isG1U1,
             block_size_M,
             # activation=activation,
@@ -343,7 +768,7 @@ def fused_moe_(
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
-            moe_buf,
+            moe_out,
             isG1U1,
             block_size_M,
             activation=activation,
@@ -362,6 +787,55 @@ def fused_moe_(
             bias1=bias1,
             bias2=bias2,
         )
+
+
+@torch_compile_guard(gen_fake=fused_moe_fake)
+def fused_moe_(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: Optional[torch.Tensor] = None,  # EP
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_size_M: int = -1,
+    num_local_tokens: Optional[torch.Tensor] = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: Optional[torch.dtype] = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: Optional[torch.Tensor] = None,
+    bias2: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return _fused_moe_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        activation,
+        quant_type,
+        doweight_stage1,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        block_size_M,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+        dtype,
+        hidden_pad,
+        intermediate_pad,
+        bias1,
+        bias2,
+    )
 
 
 def fused_moe_1stage(
@@ -723,6 +1197,342 @@ def _flydsl_stage2_wrapper(
     )
 
 
+def _rdna4_flydsl_dtype_tags(dtype: torch.dtype) -> tuple[str, str]:
+    if dtype == dtypes.fp16:
+        return "fp16", "f16"
+    if dtype == dtypes.bf16:
+        return "bf16", "bf16"
+    raise ValueError(f"Unsupported RDNA4 FlyDSL MoE dtype: {dtype}")
+
+
+def _rdna4_pick_block_m(block_m: int) -> int:
+    block_m = int(block_m)
+    if block_m <= 16:
+        return 16
+    if block_m <= 32:
+        return 32
+    return 64
+
+
+def _rdna4_pick_stage1_tile_n(tile_m: int) -> int:
+    override = os.environ.get("AITER_RDNA4_FLYDSL_MOE_STAGE1_TILE_N")
+    if override is not None:
+        try:
+            tile_n = int(override)
+        except ValueError:
+            tile_n = 0
+        if tile_n in {32, 64, 128}:
+            return tile_n
+
+    # On gfx120x the narrower stage1 N tile improves occupancy and decode
+    # throughput for the standard fp16/bf16 path when tile_m stays in the
+    # 16/32 regime. Keep the wider variant for the larger 64-row tile.
+    return 32 if int(tile_m) < 64 else 128
+
+
+def _rdna4_pick_stage1_waves_per_eu(tile_m: int) -> int:
+    override = os.environ.get("AITER_RDNA4_FLYDSL_MOE_STAGE1_WAVES_PER_EU")
+    if override is not None:
+        try:
+            waves = int(override)
+        except ValueError:
+            waves = 0
+        if waves in {1, 2, 3, 4}:
+            return waves
+
+    return 4 if int(tile_m) < 64 else 2
+
+
+def _rdna4_pick_stage2_mode() -> str:
+    # Keep RDNA4 on the validated reduction path by default. Atomic mode
+    # remains opt-in for debugging while the direct accumulate path matures.
+    mode = os.environ.get("AITER_RDNA4_FLYDSL_MOE_STAGE2_MODE", "reduce")
+    mode = str(mode).strip().lower()
+    return mode if mode in {"atomic", "reduce"} else "reduce"
+
+
+_RDNA4_TRITON_E2E_CONFIG = {
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K1": 64,
+    "BLOCK_SIZE_K2": 64,
+    "GROUP_SIZE_M": 2,
+}
+
+
+def _rdna4_standard_moe_base_eligible(
+    *,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    is_shuffled,
+) -> bool:
+    if get_gfx() not in _GFX120X_ARCHES:
+        return False
+    if q_type != QuantType.No:
+        return False
+    if activation != ActivationType.Silu:
+        return False
+    if not bool(use_g1u1):
+        return False
+    if bool(is_shuffled):
+        return False
+    if dtype not in [dtypes.fp16, dtypes.bf16]:
+        return False
+    return q_dtype_a == dtype and q_dtype_w == dtype
+
+
+def _rdna4_flydsl_shape_supported(*, token: int, model_dim: int) -> bool:
+    token = int(token)
+    model_dim = int(model_dim)
+    # Validated envelope on gfx120x:
+    # - standard MoE hidden sizes up to 5120 work across prefill/decode
+    # - larger hidden sizes are currently stable on the decode / small-M regime
+    return model_dim <= 5120 or token <= 1024
+
+
+def _rdna4_pick_stage2_tile_n(token: int, model_dim: int) -> int:
+    override = os.environ.get("AITER_RDNA4_FLYDSL_MOE_STAGE2_TILE_N")
+    if override is not None:
+        try:
+            tile_n = int(override)
+        except ValueError:
+            tile_n = 0
+        if tile_n in {32, 64, 128}:
+            return tile_n
+
+    # After fixing the RDNA4 standard-weight layout path, the wider stage2
+    # tile improves the block_m=16 regime (decode and short-prefill shapes)
+    # while the original 32-wide tile remains the safer choice once the
+    # heuristic moves to larger routing blocks.
+    if int(model_dim) <= 5120:
+        return 128 if int(token) < 2048 else 32
+    return 64
+
+
+def _rdna4_flydsl_fast_path_available(
+    *,
+    token,
+    model_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    is_shuffled,
+) -> bool:
+    if not is_flydsl_available():
+        return False
+    if not _rdna4_standard_moe_base_eligible(
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        use_g1u1=use_g1u1,
+        activation=activation,
+        is_shuffled=is_shuffled,
+    ):
+        return False
+    if not _rdna4_flydsl_shape_supported(token=token, model_dim=model_dim):
+        return False
+    return aiter.ops.flydsl.moe_kernels.rdna4_standard_moe_available(dtype)
+
+
+def _rdna4_should_use_triton_e2e(
+    *,
+    token,
+    model_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    activation,
+    is_shuffled,
+    expert_mask,
+    num_local_tokens,
+) -> bool:
+    if not _rdna4_standard_moe_base_eligible(
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        use_g1u1=use_g1u1,
+        activation=activation,
+        is_shuffled=is_shuffled,
+    ):
+        return False
+    if expert_mask is not None or num_local_tokens is not None:
+        return False
+    return not _rdna4_flydsl_shape_supported(token=token, model_dim=model_dim)
+
+
+def _rdna4_triton_e2e_moe(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    dtype,
+):
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+    from aiter.ops.triton.moe.moe_op_e2e import (
+        e2e_moe,
+        moe_set_use_persistent_kernel,
+    )
+
+    device = hidden_states.device
+    token_num, model_dim = hidden_states.shape
+    num_experts = w1.shape[0]
+    topk = topk_ids.shape[1]
+    cfg = dict(_RDNA4_TRITON_E2E_CONFIG)
+
+    topk_ids_i32 = topk_ids.to(dtype=dtypes.i32)
+    topk_weights_f32 = topk_weight.to(dtype=dtypes.fp32)
+    max_num_tokens_padded = int(
+        topk_ids_i32.numel() + num_experts * (cfg["BLOCK_SIZE_M"] - 1)
+    )
+    sorted_token_ids = torch.full(
+        (max_num_tokens_padded,),
+        topk_ids_i32.numel(),
+        dtype=dtypes.i32,
+        device=device,
+    )
+    expert_ids = torch.empty(
+        (
+            (max_num_tokens_padded + cfg["BLOCK_SIZE_M"] - 1)
+            // cfg["BLOCK_SIZE_M"],
+        ),
+        dtype=dtypes.i32,
+        device=device,
+    )
+    num_tokens_post_padded = torch.empty(1, dtype=dtypes.i32, device=device)
+    moe_align_block_size_triton(
+        topk_ids_i32,
+        num_experts,
+        cfg["BLOCK_SIZE_M"],
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    )
+
+    per_expert_out = torch.zeros(
+        (token_num, topk, model_dim),
+        dtype=dtype,
+        device=device,
+    )
+    moe_set_use_persistent_kernel(False)
+    per_expert_out = e2e_moe(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        per_expert_out,
+        None,
+        None,
+        None,
+        topk_weights_f32,
+        sorted_token_ids,
+        topk_ids_i32,
+        expert_ids,
+        num_tokens_post_padded,
+        True,
+        topk,
+        False,
+        False,
+        cfg,
+    )
+    return per_expert_out.sum(dim=1)
+
+
+def _rdna4_flydsl_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    activation=ActivationType.Silu,
+    sorted_weights=None,
+    block_m=32,
+    **_kwargs,
+):
+    _ = w2
+    if activation != ActivationType.Silu:
+        raise NotImplementedError(
+            "RDNA4 FlyDSL MoE fast path currently supports ActivationType.Silu only"
+        )
+    a_dtype, out_dtype = _rdna4_flydsl_dtype_tags(hidden_states.dtype)
+    tile_m = _rdna4_pick_block_m(block_m)
+    tile_n = _rdna4_pick_stage1_tile_n(tile_m)
+    waves_per_eu = _rdna4_pick_stage1_waves_per_eu(tile_m)
+    return aiter.ops.flydsl.flydsl_moe_stage1(
+        a=hidden_states,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=128,
+        a_dtype=a_dtype,
+        b_dtype=a_dtype,
+        out_dtype=out_dtype,
+        act="silu",
+        sorted_weights=sorted_weights,
+        use_async_copy=True,
+        waves_per_eu=waves_per_eu,
+    )
+
+
+def _rdna4_flydsl_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    *,
+    sorted_weights=None,
+    block_m=32,
+    **_kwargs,
+):
+    _ = w1
+    a_dtype, out_dtype = _rdna4_flydsl_dtype_tags(inter_states.dtype)
+    tile_m = _rdna4_pick_block_m(block_m)
+    tile_n = _rdna4_pick_stage2_tile_n(inter_states.shape[0], w2.shape[1])
+    return aiter.ops.flydsl.flydsl_moe_stage2(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=128,
+        a_dtype=a_dtype,
+        b_dtype=a_dtype,
+        out_dtype=out_dtype,
+        mode=_rdna4_pick_stage2_mode(),
+        sorted_weights=sorted_weights,
+        sort_block_m=block_m,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -866,6 +1676,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        arch_1stage_dict = fused_moe_1stage_dict.get(get_gfx(), {})
         if (
             activation,
             q_type,
@@ -874,7 +1685,7 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict[get_gfx()]:
+        ) in arch_1stage_dict:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = token > 32 and (inter_dim % 256 == 0)
@@ -923,10 +1734,37 @@ def get_2stage_cfgs(
                 "Running with preshuffle_off may produce incorrect results."
             )
 
-    tag = f"({kernelName1=}, {kernelName2=})"
+        tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
+
+    if _rdna4_flydsl_fast_path_available(
+        token=token,
+        model_dim=model_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        use_g1u1=use_g1u1,
+        activation=activation,
+        is_shuffled=is_shuffled,
+    ):
+        block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        logger.info(
+            "[fused_moe] using RDNA4 FlyDSL 2-stage backend on %s",
+            get_gfx(),
+        )
+        return MOEMetadata(
+            functools.partial(
+                _rdna4_flydsl_stage1_wrapper,
+                activation=activation,
+            ),
+            functools.partial(_rdna4_flydsl_stage2_wrapper),
+            block_m,
+            0,
+            False,
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:

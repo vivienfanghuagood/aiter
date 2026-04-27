@@ -5,15 +5,17 @@ import torch
 from torch import Tensor
 from typing import Optional
 from ..jit.core import compile_ops, AITER_CSRC_DIR
+from ..jit.utils.chip_info import get_gfx
 from .enum import ActivationType, Enum, QuantType
 from ..utility import dtypes
 import functools
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
+_GFX120X_ARCHES = frozenset({"gfx1200", "gfx1201"})
 
 
-@compile_ops("module_moe_asm")
-def topk_softmax(
+@compile_ops("module_moe_asm", fc_name="topk_softmax")
+def topk_softmax_hip(
     topk_weights: Tensor,
     topk_indices: Tensor,
     token_expert_indices: Tensor,
@@ -36,10 +38,89 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
-@compile_ops("module_moe_topk")
-def topk_sigmoid(
+@compile_ops("module_moe_topk", fc_name="topk_sigmoid")
+def topk_sigmoid_hip(
     topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
 ) -> None: ...
+
+
+def _use_gfx120x_topk_fallback() -> bool:
+    return get_gfx() in _GFX120X_ARCHES
+
+
+def _copy_topk_outputs(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Optional[Tensor],
+    weights: Tensor,
+    indices: Tensor,
+) -> None:
+    topk_weights.copy_(weights.to(dtype=topk_weights.dtype))
+    topk_indices.copy_(indices.to(dtype=topk_indices.dtype))
+    if token_expert_indices is not None:
+        token_expert_indices.zero_()
+
+
+def topk_softmax(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
+) -> None:
+    if _use_gfx120x_topk_fallback():
+        if num_shared_experts != 0 or shared_expert_scoring_func:
+            raise NotImplementedError(
+                "RDNA4 topk_softmax fallback does not support shared experts"
+            )
+        scores = torch.softmax(gating_output.to(dtypes.fp32), dim=-1)
+        weights, indices = torch.topk(
+            scores, k=topk_indices.shape[1], dim=-1, sorted=False
+        )
+        if need_renorm:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        _copy_topk_outputs(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            weights,
+            indices,
+        )
+        return None
+
+    return topk_softmax_hip(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+    )
+
+
+def topk_sigmoid(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    gating_output: Tensor,
+) -> None:
+    if _use_gfx120x_topk_fallback():
+        scores = gating_output.to(dtypes.fp32).sigmoid()
+        weights, indices = torch.topk(
+            scores, k=topk_indices.shape[1], dim=-1, sorted=False
+        )
+        _copy_topk_outputs(
+            topk_weights,
+            topk_indices,
+            None,
+            weights,
+            indices,
+        )
+        return None
+
+    return topk_sigmoid_hip(topk_weights, topk_indices, gating_output)
 
 
 @compile_ops("module_moe_asm")

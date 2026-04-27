@@ -8,8 +8,11 @@ from typing import Optional, Tuple
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
+
+
+_GFX120X_ARCHES = frozenset({"gfx1200", "gfx1201"})
 
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
@@ -25,8 +28,8 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
-def grouped_topk(
+@compile_ops("module_moe_asm", fc_name="grouped_topk")
+def grouped_topk_hip(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -72,6 +75,20 @@ def moe_fused_gate(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
+def _use_gfx120x_grouped_topk_fallback() -> bool:
+    return get_gfx() in _GFX120X_ARCHES
+
+
+def _copy_grouped_topk_outputs(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+) -> None:
+    topk_weights.copy_(weights.to(dtype=topk_weights.dtype))
+    topk_ids.copy_(ids.to(dtype=topk_ids.dtype))
+
+
 def biased_grouped_topk(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -82,6 +99,20 @@ def biased_grouped_topk(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
+    if _use_gfx120x_grouped_topk_fallback():
+        weights, ids = biased_grouped_topk_torch(
+            gating_output,
+            correction_bias,
+            topk=topk_ids.shape[1],
+            renormalize=need_renorm,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
+        if routed_scaling_factor != 1.0:
+            weights = weights * routed_scaling_factor
+        _copy_grouped_topk_outputs(topk_weights, topk_ids, weights, ids)
+        return None
+
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
@@ -110,6 +141,42 @@ def biased_grouped_topk(
             n_share_experts_fusion=0,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+
+def grouped_topk(
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    need_renorm: bool,
+    is_softmax: bool = True,
+    routed_scaling_factor: float = 1.0,
+) -> None:
+    if _use_gfx120x_grouped_topk_fallback():
+        weights, ids = grouped_topk_torch(
+            gating_output,
+            topk=topk_ids.shape[1],
+            renormalize=need_renorm,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func="softmax" if is_softmax else "sigmoid",
+        )
+        if routed_scaling_factor != 1.0:
+            weights = weights * routed_scaling_factor
+        _copy_grouped_topk_outputs(topk_weights, topk_ids, weights, ids)
+        return None
+
+    return grouped_topk_hip(
+        gating_output,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        need_renorm,
+        is_softmax,
+        routed_scaling_factor,
+    )
 
 
 # this one copied from sglang

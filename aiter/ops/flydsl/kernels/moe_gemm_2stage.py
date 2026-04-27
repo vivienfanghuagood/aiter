@@ -2941,6 +2941,31 @@ class MoeGemm2Mode:
     REDUCE = "reduce"  # Use non-atomic write + reduce kernel
 
 
+# Keep the public compile API source-compatible across CDNA / gfx1250 / RDNA4
+# even if some options are arch-specific; builders can opt in to receiving
+# extras they understand while older paths silently discard the rest.
+_MOE_PUBLIC_EXTRA_KWARGS = (
+    "group_size",
+    "use_cshuffle_epilog",
+    "num_buffers",
+    "use_tdm_gather",
+    "use_tdm_store",
+    "inst_prefetch",
+    "wave_specialized_tdm",
+    "cluster_m",
+    "cluster_n",
+)
+
+
+def _moe_strip_extras(kw: dict, allowed_extras: tuple = ()) -> dict:
+    result = dict(kw)
+    for key in _MOE_PUBLIC_EXTRA_KWARGS:
+        if key in allowed_extras:
+            continue
+        result.pop(key, None)
+    return result
+
+
 class _MoeGemm2ReduceWrapper:
     """Wrapper combining GEMM2 (no atomics) with reduction kernel.
 
@@ -3048,6 +3073,58 @@ class _MoeGemm2ReduceWrapper:
     def mode(self) -> str:
         """Return the execution mode."""
         return MoeGemm2Mode.REDUCE
+
+
+def make_moe_public_api(compile_impl, *, pass_through_kwargs: tuple = ()):
+    """Create compile wrappers with a stable cross-arch public signature."""
+
+    def compile_moe_gemm1(*, doweight_stage1, **kw):
+        kw = _moe_strip_extras(kw, pass_through_kwargs)
+        return compile_impl(stage=1, doweight=doweight_stage1, **kw)
+
+    def compile_moe_gemm2(*, doweight_stage2, accumulate=True, **kw):
+        kw = _moe_strip_extras(kw, pass_through_kwargs)
+        return compile_impl(
+            stage=2,
+            doweight=doweight_stage2,
+            accumulate=accumulate,
+            **kw,
+        )
+
+    def compile_moe_gemm2_ex(
+        *,
+        mode=MoeGemm2Mode.ATOMIC,
+        valid_mask=None,
+        zero_intermediate=True,
+        **kw,
+    ):
+        if mode == MoeGemm2Mode.REDUCE:
+            gemm2_exe = compile_moe_gemm2(accumulate=False, **kw)
+            out_s = str(kw.get("out_dtype", "f16")).strip().lower()
+            if out_s in ("f16", "fp16", "half"):
+                dtype_str = "f16"
+            elif out_s in ("bf16", "bfloat16"):
+                dtype_str = "bf16"
+            else:
+                dtype_str = "f32"
+            reduce_exe = compile_moe_reduction(
+                topk=kw["topk"],
+                model_dim=kw["model_dim"],
+                dtype_str=dtype_str,
+                use_mask=(valid_mask is not None),
+            )
+            return _MoeGemm2ReduceWrapper(
+                gemm2_exe=gemm2_exe,
+                reduce_exe=reduce_exe,
+                topk=kw["topk"],
+                model_dim=kw["model_dim"],
+                out_dtype_str=dtype_str,
+                use_mask=(valid_mask is not None),
+                zero_intermediate=zero_intermediate,
+            )
+        return compile_moe_gemm2(accumulate=True, **kw)
+
+    return compile_moe_gemm1, compile_moe_gemm2, compile_moe_gemm2_ex
 
 
 def compile_moe_gemm2_ex(
